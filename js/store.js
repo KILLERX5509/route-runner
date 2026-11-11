@@ -91,6 +91,13 @@ export const geocache_ = {
     }
     write(K_GEOCACHE, geocache);
   },
+  remove(address) {
+    geocache ??= read(K_GEOCACHE, {});
+    if (geocache[normAddr(address)]) {
+      delete geocache[normAddr(address)];
+      write(K_GEOCACHE, geocache);
+    }
+  },
   clear() {
     geocache = {};
     write(K_GEOCACHE, geocache);

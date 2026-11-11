@@ -348,13 +348,45 @@ export function addressVariants(address) {
 
 const cityOf = (address) => (address.split(',')[1] || '').trim().toLowerCase();
 
+const US_STATES = new Set(('AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY PR').split(' '));
+
+// The two-letter state written near the end of an address ("..., Columbus, MS 39701" -> "MS").
+export function stateOf(address) {
+  const tail = String(address || '').split(',').slice(1).join(',');
+  const m = tail.match(/\b([A-Za-z]{2})\.?\s*(?:\d{5}(?:-\d{4})?)?\s*(?:,\s*(?:USA|US|United States))?\s*$/);
+  const st = m && m[1].toUpperCase();
+  return st && US_STATES.has(st) ? st : null;
+}
+
 async function censusGeocode(text, expectCity, signal) {
   const url = `${CENSUS}?address=${encodeURIComponent(text)}&benchmark=Public_AR_Current&format=jsonp`;
   const j = await jsonp(url, signal);
   const matches = j?.result?.addressMatches || [];
-  const m = matches.find((x) => !expectCity || (x.addressComponents?.city || '').toLowerCase() === expectCity) || null;
+  const want = stateOf(text);
+  const m = matches.find((x) =>
+    (!expectCity || (x.addressComponents?.city || '').toLowerCase() === expectCity)
+    && (!want || !x.addressComponents?.state || x.addressComponents.state.toUpperCase() === want)) || null;
   if (!m) return null;
-  return { lat: m.coordinates.y, lng: m.coordinates.x, precision: 'exact', source: 'census', matched: m.matchedAddress };
+  return { lat: m.coordinates.y, lng: m.coordinates.x, precision: 'exact', source: 'census', matched: m.matchedAddress, state: m.addressComponents?.state?.toUpperCase() };
+}
+
+// Stops whose pin sits far away from all the others. That's almost always a
+// lookup that matched a same-named street or business in another town or state.
+// Only pins that came from an address lookup are checked; pins you placed
+// yourself, or coordinates from the spreadsheet, are left alone.
+export function farStops(stops) {
+  const mapped = stops.filter((s) => s.lat != null && s.lng != null);
+  if (mapped.length < 5) return [];
+  const median = (a) => {
+    const b = [...a].sort((x, y) => x - y);
+    const m = b.length >> 1;
+    return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2;
+  };
+  const center = { lat: median(mapped.map((s) => s.lat)), lng: median(mapped.map((s) => s.lng)) };
+  const dist = new Map(mapped.map((s) => [s, haversine(center, s)]));
+  const typical = median([...dist.values()]);
+  const limit = Math.max(60000, typical * 6); // at least 60 km (about 37 miles)
+  return mapped.filter((s) => dist.get(s) > limit && s.geo && s.geo !== 'manual');
 }
 
 async function orsGeocode(key, text, focus, signal) {
@@ -381,7 +413,7 @@ async function orsGeocode(key, text, focus, signal) {
   const [lng, lat] = f.geometry.coordinates;
   const layer = f.properties?.layer;
   const precision = layer === 'address' || layer === 'venue' ? 'exact' : layer === 'street' ? 'street' : 'rough';
-  return { lat, lng, precision, source: 'ors' };
+  return { lat, lng, precision, source: 'ors', state: (f.properties?.region_a || '').toUpperCase() || null };
 }
 
 // Nominatim allows about one request a second; queue them.
@@ -396,6 +428,7 @@ function nominatim(params, signal) {
     u.searchParams.set('format', 'jsonv2');
     u.searchParams.set('limit', '1');
     u.searchParams.set('countrycodes', 'us');
+    u.searchParams.set('addressdetails', '1');
     for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
     let res;
     try { res = await fetch(u, { signal, headers: { 'Accept-Language': 'en' } }); } catch (e) {
@@ -408,7 +441,9 @@ function nominatim(params, signal) {
     const exact = r.type === 'house' || ['house', 'building'].includes(r.addresstype)
       || ['building', 'amenity', 'shop', 'office', 'tourism', 'leisure', 'craft', 'healthcare'].includes(r.category);
     const street = ['road', 'street'].includes(r.addresstype) || r.category === 'highway';
-    return { lat: +r.lat, lng: +r.lon, precision: exact ? 'exact' : street ? 'street' : 'rough', source: 'osm' };
+    const iso = r.address?.['ISO3166-2-lvl4'] || '';
+    const state = iso.startsWith('US-') ? iso.slice(3).toUpperCase() : null;
+    return { lat: +r.lat, lng: +r.lon, precision: exact ? 'exact' : street ? 'street' : 'rough', source: 'osm', state };
   };
   const p = nomChain.then(run, run);
   nomChain = p.catch(() => {});
@@ -421,8 +456,11 @@ export async function geocodeOne(stopOrText, { key, focus, signal } = {}) {
   const name = typeof stopOrText === 'string' ? '' : stopOrText.name || '';
   if (!address && !name) return null;
   const expectCity = cityOf(address);
+  const expectState = stateOf(address);
   let best = null;
-  const better = (r) => r && (!best || RANK[r.precision] > RANK[best.precision]);
+  // A result only counts if it's in the state the address says.
+  const better = (r) => r && (!expectState || !r.state || r.state === expectState)
+    && (!best || RANK[r.precision] > RANK[best.precision]);
 
   // 1. Census, with spelling variants
   if (address) {
@@ -435,7 +473,7 @@ export async function geocodeOne(stopOrText, { key, focus, signal } = {}) {
       if (r) {
         if (v.guess) r.precision = 'street';
         if (better(r)) best = r;
-        if (best.precision === 'exact') return best;
+        if (best?.precision === 'exact') return best;
       }
     }
   }

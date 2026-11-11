@@ -1,11 +1,11 @@
 import { solveRoute, routeCost } from './optimizer.js';
 import { FIELDS, parseFile, parseDelimited, detectColumns, buildStops, needsArea, cleanAddress } from './importer.js';
-import { geocodeStops, geocodeOne, driveMatrix, roadLine, haversine, testOrsKey, arrivalSide, snapToBusinesses } from './services.js';
+import { geocodeStops, geocodeOne, driveMatrix, roadLine, haversine, testOrsKey, arrivalSide, snapToBusinesses, farStops } from './services.js';
 import { createMapView } from './mapview.js';
 import { createNavigator } from './nav.js';
 import * as store from './store.js';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.2.1';
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -36,8 +36,33 @@ const state = {
   gcAbort: null,
 };
 
+// On a computer or tablet-width screen, the route panel is a sidebar instead of a drag-up sheet.
+const wideQuery = window.matchMedia('(min-width: 760px)');
+const isWide = () => wideQuery.matches;
+
 // Older versions stored some addresses with the city and ZIP written twice.
 for (const r of state.routes) for (const s of r.stops || []) if (s.lat == null && s.address) s.address = cleanAddress(s.address);
+
+// A pin far away from the rest of its route came from a lookup that matched the
+// wrong town or state. Take it off the map (and out of the lookup memory) so it
+// gets looked up again instead of wrecking the route order.
+function pullFarStops(r) {
+  if (!r?.stops) return 0;
+  const far = farStops(r.stops).filter((s) => s.status !== 'done');
+  for (const s of far) {
+    if (s.address) store.geocache_.remove(s.address);
+    Object.assign(s, { lat: null, lng: null, precision: null, geo: 'far', leg: null });
+  }
+  return far.length;
+}
+const pulledAtStart = new Map();
+for (const r of state.routes) { const n = pullFarStops(r); if (n) pulledAtStart.set(r.id, n); }
+if (pulledAtStart.size) store.saveRoutes(state.routes);
+
+function farToast(n) {
+  toast(`${n} ${n === 1 ? 'stop was' : 'stops were'} pinned in the wrong town, far from the rest, so I took ${n === 1 ? 'it' : 'them'} off the map. Tap Fix to look ${n === 1 ? 'it' : 'them'} up again.`,
+    { action: 'Fix', run: reviewScreen, duration: 12000 });
+}
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -107,11 +132,14 @@ function openRoute(id) {
   state.selectedId = null;
   state.roadLine = null;
   state.roadSig = '';
+  const pulled = pullFarStops(state.route);
+  if (pulled) saveRoute(false);
   renderAll();
   setSheet('peek');
   fitAll();
   maybeRoadLine();
   snapPinsOnce(state.route);
+  if (pulled) farToast(pulled);
 }
 
 /* ---------------------------------------------------------------------- map */
@@ -273,6 +301,10 @@ function topInset() {
   return $('.topbar').getBoundingClientRect().bottom + 12;
 }
 function mapPadding() {
+  if (isWide()) {
+    const side = sheet.getBoundingClientRect().right;
+    return { top: topInset(), bottom: 40, left: side + 40, right: 80 };
+  }
   return { top: topInset(), bottom: Math.min(visibleSheet(), window.innerHeight * 0.65) + 20, left: 36, right: 36 };
 }
 
@@ -426,6 +458,16 @@ function visibleSheet() {
 }
 
 function setSheet(name, animate = true) {
+  const attrBox = $('.maplibregl-ctrl-bottom-right');
+  if (isWide()) {
+    // Sidebar: always fully open, scrolls on its own.
+    state.snap = 'full';
+    sheet.dataset.snap = 'full';
+    sheet.classList.remove('anim');
+    sheet.style.transform = '';
+    if (attrBox) attrBox.style.bottom = '';
+    return;
+  }
   const opts = snapOffsets();
   const target = opts.find((o) => o.name === name) || opts[0];
   state.snap = target.name;
@@ -445,6 +487,7 @@ function cycleSheet() {
 
 let drag = null, suppressClick = false;
 sheet.addEventListener('pointerdown', (e) => {
+  if (isWide()) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   if (state.snap === 'full' && !e.target.closest('.sheet-top')) return;
   if (e.target.closest('input, select, textarea')) return;
@@ -1113,6 +1156,7 @@ async function geocodeFlow(r, onlyStops = null, { before } = {}) {
   }
   state.gcAbort = null;
   before?.();
+  pullFarStops(r);
   saveRoute();
   closeScreen();
   if (res.keyProblem) toast(`${res.keyProblem} Used the free lookup instead.`, { duration: 7000 });
@@ -1160,7 +1204,7 @@ function reviewScreen() {
       <button class="grow" type="button" data-action="edit-stop" data-id="${s.id}">
         <b>${numOf(s)}. ${esc(s.name)}</b>
         <span>${esc(s.address || 'No address')}</span>
-        <span>${s.lat == null ? 'Not found. Edit the address or place it on the map.' : s.precision === 'street' ? 'Pin is on the right road, maybe not the exact building.' : 'Pin is only in the right area.'}</span>
+        <span>${s.lat == null ? (s.geo === 'far' ? 'Was matched to a place far from your other stops. Look it up again, edit the address, or place it on the map.' : 'Not found. Edit the address or place it on the map.') : s.precision === 'street' ? 'Pin is on the right road, maybe not the exact building.' : 'Pin is only in the right area.'}</span>
       </button>
       <button class="more" type="button" data-action="stop" data-id="${s.id}" aria-label="More for ${esc(s.name)}">${ICON.more}</button>
     </div>`).join('');
@@ -1611,7 +1655,10 @@ document.addEventListener('visibilitychange', () => {
 applyTheme();
 state.route = state.routes.find((r) => r.id === store.loadCurrentId()) || null;
 renderAll();
-requestAnimationFrame(() => { setSheet('peek', false); fitAll(); maybeRoadLine(); snapPinsOnce(state.route); });
+requestAnimationFrame(() => {
+  setSheet('peek', false); fitAll(); maybeRoadLine(); snapPinsOnce(state.route);
+  if (state.route && pulledAtStart.get(state.route.id)) farToast(pulledAtStart.get(state.route.id));
+});
 
 navigator.permissions?.query({ name: 'geolocation' }).then((p) => { if (p.state === 'granted') startWatch(); }).catch(() => {});
 

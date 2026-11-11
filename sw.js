@@ -2,7 +2,7 @@
 // falling back to the saved copy when there's no signal. Map tiles, map fonts
 // and the Excel reader: saved copy first.
 
-const VERSION = 'rr-1.2.0';
+const VERSION = 'rr-1.2.1';
 const SHELL = [
   './',
   './index.html',
