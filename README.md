@@ -27,9 +27,16 @@ To update later, upload the new files the same way. They replace the old ones.
   matched automatically. If a file has several sheets, pick one.
 - **Optimize**: puts the remaining stops in the fastest order from your location,
   using real drive times.
-- **Go**: turn-by-turn directions in the app, with spoken directions, rerouting if
-  you miss a turn, and an arrival card. "Done, go to next stop" checks off the stop
-  and starts directions to the next one.
+- **Go**: turn-by-turn directions in the app. The map turns with you so the road
+  ahead is always up, with spoken directions and rerouting if you miss a turn.
+  When you pull up, a card shows the business name and address; **Next stop**
+  checks it off and starts directions to the next one.
+- **Curbside arrivals** (on by default): every approach is planned so the business
+  is on your right and you don't cross traffic. Each stop shows "Right side" or
+  "Left side" for when that isn't possible.
+- **Map**: satellite with street names (or Map / Dark in Settings). Red pins show
+  the stop number; the tip is the exact spot. Dark blue is your path to the next
+  stop, faded blue is the rest of the route.
 - Tap any stop to skip it, do it next, move it to a number, edit it, place its
   pin by hand, or call it. Press and hold the map to drop a new stop.
 - **Saved routes** keeps every route with its order and progress. Use
@@ -48,6 +55,9 @@ To update later, upload the new files the same way. They replace the old ones.
 ## Free services used (no keys needed)
 
 - Map: MapLibre GL with OpenFreeMap tiles. Map data © OpenStreetMap contributors.
+- Satellite: USGS The National Map aerial imagery (public domain). Optional free
+  ArcGIS key in Settings for sharper Esri imagery up close.
+- Business locations: OpenStreetMap via Overpass, used to put pins on the building.
 - Directions and drive times: OSRM on the FOSSGIS routing server.
 - Address lookup: U.S. Census Bureau geocoder, then OpenStreetMap Nominatim.
 - Optional backup: a free OpenRouteService key (Settings) is used if the routing
@@ -57,7 +67,7 @@ To update later, upload the new files the same way. They replace the old ones.
 
 - `index.html`, `css/app.css`: layout and design
 - `js/app.js`: panels, import flow, saved routes, settings
-- `js/mapview.js`: the map
+- `js/mapview.js`: the map, pins, satellite view and route lines
 - `js/nav.js`, `js/router.js`: turn-by-turn navigation
 - `js/optimizer.js`: route ordering (exact up to 13 stops; fast local search above)
 - `js/importer.js`: CSV/Excel reading, column matching, address cleanup

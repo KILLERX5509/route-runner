@@ -7,15 +7,25 @@ import { osrmGet, coordPath, orsPostRaw, haversine } from './services.js';
 // { coords: [[lng,lat]...], cum: [meters along route at each coord], distance, duration,
 //   steps: [{ type, modifier, exit, name, ref, distance, duration, startIndex, startDist, text, minor }] }
 
-export async function getDirections(from, to, { orsKey, heading, destName, signal } = {}) {
+export async function getDirections(from, to, { orsKey, heading, destName, signal, curb = true } = {}) {
   let route = null, err = null;
+  const bearing = Number.isFinite(heading) ? `&bearings=${Math.round((heading + 360) % 360)},60;` : '';
+  const curbParam = curb ? '&approaches=;curb' : '';
   try {
-    const bearing = Number.isFinite(heading) ? `&bearings=${Math.round((heading + 360) % 360)},60;` : '';
-    const j = await osrmGet(`/route/v1/driving/${coordPath([from, to])}?overview=false&steps=true&geometries=geojson${bearing}`, signal);
+    const j = await osrmGet(`/route/v1/driving/${coordPath([from, to])}?overview=false&steps=true&geometries=geojson${bearing}${curbParam}`, signal);
     route = fromOsrm(j, destName);
   } catch (e) {
     if (e.name === 'AbortError') throw e;
     err = e;
+    // If curbside can't be reached at all, take any route rather than none.
+    if (curb) {
+      try {
+        const j = await osrmGet(`/route/v1/driving/${coordPath([from, to])}?overview=false&steps=true&geometries=geojson${bearing}`, signal);
+        route = fromOsrm(j, destName);
+      } catch (e2) {
+        if (e2.name === 'AbortError') throw e2;
+      }
+    }
   }
   if (!route && orsKey) {
     try {
@@ -30,6 +40,8 @@ export async function getDirections(from, to, { orsKey, heading, destName, signa
   }
   if (!route) throw err || new Error('No route found');
   finish(route);
+  const arrive = route.steps[route.steps.length - 1];
+  route.side = arrive?.type === 'arrive' && (arrive.modifier === 'left' || arrive.modifier === 'right') ? arrive.modifier : null;
   return route;
 }
 

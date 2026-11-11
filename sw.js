@@ -2,7 +2,7 @@
 // falling back to the saved copy when there's no signal. Map tiles, map fonts
 // and the Excel reader: saved copy first.
 
-const VERSION = 'rr-1.1.0';
+const VERSION = 'rr-1.2.0';
 const SHELL = [
   './',
   './index.html',
@@ -50,6 +50,8 @@ self.addEventListener('fetch', (e) => {
   } else if (url.hostname === 'tiles.openfreemap.org') {
     // Map styles can change; tiles, fonts and icons are versioned and safe to keep.
     e.respondWith(url.pathname.startsWith('/styles/') ? networkFirst(req, TILE_CACHE) : cacheFirst(req, TILE_CACHE, true));
+  } else if (url.hostname === 'basemap.nationalmap.gov') {
+    e.respondWith(cacheFirst(req, TILE_CACHE, true)); // public-domain aerial photos
   } else if (url.hostname === 'cdn.sheetjs.com') {
     e.respondWith(cacheFirst(req, LIB_CACHE, false));
   }

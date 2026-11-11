@@ -3,7 +3,7 @@
 import { getDirections, arrowFor, roadName } from './router.js';
 import { haversine } from './services.js';
 
-const ARRIVE_METERS = 35;
+const ARRIVE_METERS = 40;
 const OFF_ROUTE_METERS = 45;
 const REROUTE_GAP_MS = 6000;
 
@@ -50,7 +50,7 @@ function projector(lat0, lng0) {
   return (lng, lat) => [(lng - lng0) * kx, (lat - lat0) * ky];
 }
 
-export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onChange, fallbackNav }) {
+export function createNavigator({ mapview, getMe, getRest, getNext, settings, onArrive, onEnd, onChange, fallbackNav }) {
   const S = {
     active: false, stop: null, num: 0, route: null, idx: 0, along: 0,
     off: 0, lastReroute: 0, routing: false, said: new Map(), follow: true,
@@ -96,7 +96,7 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
       <div class="nav-bottom">
         <div class="nav-dest">
           <span class="shield" id="nav-num">${S.num}</span>
-          <div class="nav-dest-text"><b>${esc(S.stop.name)}</b><span id="nav-eta">&nbsp;</span></div>
+          <div class="nav-dest-text"><b>${esc(S.stop.name)} <em class="side-tag" id="nav-side"></em></b><span id="nav-eta">&nbsp;</span></div>
         </div>
         <div class="nav-btns">
           <button class="btn btn-secondary" type="button" id="nav-voice" aria-pressed="${settings().voice}">${settings().voice ? 'Voice on' : 'Voice off'}</button>
@@ -147,18 +147,43 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     let b = scan(S.idx - 15, S.idx + 250);
     if (b.d > 80) { const all = scan(0, n); if (all.d < b.d) b = all; }
     const segLen = r.cum[b.i + 1] - r.cum[b.i];
+    const along = r.cum[b.i] + b.t * segLen;
     const a = r.coords[b.i], c = r.coords[b.i + 1];
-    const bearing = (Math.atan2(
-      Math.sin(((c[0] - a[0]) * Math.PI) / 180) * Math.cos((c[1] * Math.PI) / 180),
-      Math.cos((a[1] * Math.PI) / 180) * Math.sin((c[1] * Math.PI) / 180) - Math.sin((a[1] * Math.PI) / 180) * Math.cos((c[1] * Math.PI) / 180) * Math.cos(((c[0] - a[0]) * Math.PI) / 180),
-    ) * 180) / Math.PI;
-    return { dist: b.d, idx: b.i, along: r.cum[b.i] + b.t * segLen, bearing: (bearing + 360) % 360 };
+    const point = { lng: a[0] + (c[0] - a[0]) * b.t, lat: a[1] + (c[1] - a[1]) * b.t };
+    // Point the map along the road a little ahead, so it turns smoothly into curves.
+    const ahead = pointAt(r, Math.min(r.distance, along + 25));
+    const bearing = bearingTo(point, ahead.dist > along + 1 ? ahead : { lng: c[0], lat: c[1] });
+    return { dist: b.d, idx: b.i, along, bearing, point };
   }
 
-  function camera(me) {
+  function pointAt(r, d) {
+    let i = 0;
+    while (i < r.cum.length - 2 && r.cum[i + 1] < d) i++;
+    const seg = r.cum[i + 1] - r.cum[i] || 1;
+    const t = Math.max(0, Math.min(1, (d - r.cum[i]) / seg));
+    const a = r.coords[i], c = r.coords[i + 1] || a;
+    return { lng: a[0] + (c[0] - a[0]) * t, lat: a[1] + (c[1] - a[1]) * t, dist: r.cum[i] + t * seg };
+  }
+
+  function bearingTo(a, c) {
+    const rad = Math.PI / 180;
+    const y = Math.sin((c.lng - a.lng) * rad) * Math.cos(c.lat * rad);
+    const x = Math.cos(a.lat * rad) * Math.sin(c.lat * rad) - Math.sin(a.lat * rad) * Math.cos(c.lat * rad) * Math.cos((c.lng - a.lng) * rad);
+    return ((Math.atan2(y, x) / rad) + 360) % 360;
+  }
+
+  // Dark blue: what's left of the drive to this stop. Faded blue: the stops after it.
+  function drawLines(sp) {
+    const r = S.route;
+    let current = r.coords;
+    if (sp) current = [[sp.point.lng, sp.point.lat], ...r.coords.slice(sp.idx + 1)];
+    mapview.setRoute({ current, rest: getRest?.(S.stop) || [] });
+  }
+
+  function camera(p) {
     if (!S.follow) return;
     const zoom = S.speed > 22 ? 15.2 : S.speed > 12 ? 16 : 16.8;
-    mapview.follow(me, { bearing: S.heading ?? 0, zoom, padding: padding() });
+    mapview.follow(p, { bearing: S.heading ?? 0, zoom, padding: padding() });
   }
 
   function announce(step, dist) {
@@ -178,10 +203,14 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     const sp = snap(me);
     S.idx = sp.idx;
     S.along = sp.along;
+    // On the route: show the arrow on the road and face along it (steadier than GPS heading).
+    const onRoute = sp.dist < 30;
     const moving = S.speed > 2 && Number.isFinite(me.heading) && me.heading >= 0;
-    S.heading = moving ? me.heading : (sp.dist < 25 ? sp.bearing : (S.heading ?? sp.bearing));
-    mapview.setMe(me, S.heading);
-    camera(me);
+    S.heading = onRoute ? sp.bearing : moving ? me.heading : (S.heading ?? sp.bearing);
+    const shown = onRoute ? sp.point : me;
+    mapview.setMe(shown);
+    camera(shown);
+    drawLines(onRoute ? sp : null);
 
     // Off the route? Get a new one (not too often).
     const tol = Math.max(OFF_ROUTE_METERS, (me.acc || 0) * 1.2);
@@ -192,7 +221,8 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     const remaining = Math.max(0, r.distance - S.along);
     const toStop = haversine(me, S.stop);
     const snoozed = S.lastArriveDismiss && Date.now() - S.lastArriveDismiss < 90000;
-    if (!snoozed && (toStop < ARRIVE_METERS || (remaining < 25 && sp.dist < 60))) { arrive(false); return; }
+    // Arrived: close to the pin, or at the end of the route (the pin may sit back from the road).
+    if (!snoozed && (toStop < ARRIVE_METERS || (remaining < 30 && sp.dist < 60))) { arrive(false); return; }
 
     // Next step worth showing: skip the "keep going straight" ones.
     const upcoming = r.steps.filter((s) => s.startDist > S.along + 3);
@@ -227,11 +257,13 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     if (!quiet) { const d = $('#nav-dist'); if (d) d.textContent = 'Finding route'; }
     try {
       const heading = S.speed > 2 ? S.heading : undefined;
-      const route = await getDirections(me, S.stop, { orsKey: settings().orsKey, heading, destName: S.stop.name, signal: S.abort.signal });
+      const route = await getDirections(me, S.stop, { orsKey: settings().orsKey, heading, destName: S.stop.name, signal: S.abort.signal, curb: settings().curbside !== false });
       if (!S.active) return;
       S.route = route;
       S.idx = 0; S.along = 0; S.off = 0; S.said = new Map();
-      mapview.setNavLine(route.coords);
+      drawLines(null);
+      const side = $('#nav-side');
+      if (side) side.textContent = route.side ? `On your ${route.side}` : '';
       if (quiet) speak('Rerouting');
       onFix(getMe() || me);
     } catch (e) {
@@ -250,20 +282,33 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     $('#nav-ext')?.addEventListener('click', () => { const s = S.stop; end(false); fallbackNav(s); });
   }
 
+  // Pulled up at the stop: show what it is and one big button to move on.
   function arrive(manual) {
     if (S.arrived) return;
     S.arrived = true;
     const box = $('#nav-arrived');
     if (!box) return;
-    if (!manual) speak(`You have arrived at ${S.stop.name}`);
+    const side = S.route?.side;
+    if (!manual) speak(`You have arrived at ${S.stop.name}${side ? `, on your ${side}` : ''}`);
+    const next = getNext?.(S.stop);
     box.innerHTML = `
-      <div class="sign">
-        <div class="sign-row"><span class="shield">${S.num}</span><div><h2>${esc(S.stop.name)}</h2><p class="addr">You're here.</p></div></div>
+      <div class="sign arrived-card">
+        <p class="arrived-label">You've arrived${side ? `. It's on your ${side}.` : ''}</p>
+        <div class="sign-row">
+          <span class="shield">${S.num}</span>
+          <div>
+            <h2>${esc(S.stop.name)}</h2>
+            ${S.stop.address ? `<p class="addr">${esc(S.stop.address)}</p>` : ''}
+          </div>
+        </div>
+        ${S.stop.notes ? `<p class="notes">${esc(S.stop.notes)}</p>` : ''}
         <div class="nav-arrived-btns">
-          <button class="btn btn-sign-primary" type="button" id="arr-next">Done, go to next stop</button>
+          <button class="btn btn-sign-primary btn-next" type="button" id="arr-next">
+            ${next ? `<span>Next stop</span><small>${next.num}. ${esc(next.name)}</small>` : '<span>Finish route</span>'}
+          </button>
           <div class="two">
-            <button class="btn btn-sign" type="button" id="arr-done">Done, stop here</button>
             <button class="btn btn-sign" type="button" id="arr-not">Not yet</button>
+            <button class="btn btn-sign" type="button" id="arr-done">Done, end here</button>
           </div>
         </div>
       </div>`;
@@ -283,7 +328,7 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     keepAwake();
     speak(wasActive ? '' : ' '); // unlocks speech on iPhone while we still have the tap
     mapview.setNavMode(true);
-    mapview.setNavLine([]);
+    mapview.setRoute({ current: [], rest: getRest?.(stop) || [] });
     const me = getMe();
     if (!me) {
       showRouteError(new Error('Waiting for your location. Make sure location is allowed.'));
@@ -306,7 +351,6 @@ export function createNavigator({ mapview, getMe, settings, onArrive, onEnd, onC
     S.wake = null;
     ui.hidden = true;
     ui.innerHTML = '';
-    mapview.setNavLine([]);
     mapview.setNavMode(false);
     onEnd?.(userEnded);
   }

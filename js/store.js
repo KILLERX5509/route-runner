@@ -8,12 +8,14 @@ const K_GEOCACHE = 'rr.geocache.v1';
 const GEOCACHE_MAX = 3000;
 
 export const DEFAULT_SETTINGS = {
-  v: 2,
+  v: 3,
   orsKey: '',
   navApp: 'builtin',    // builtin | apple | google | waze
   voice: true,
+  curbside: true,       // plan arrivals with the stop on your right
   endMode: 'open',      // open | return
-  mapStyle: 'auto',     // auto | streets | dark
+  mapStyle: 'satellite', // satellite | map | dark
+  satKey: '',           // optional ArcGIS key for sharper imagery
   areaHint: '',
   roadLines: true,
 };
@@ -44,9 +46,14 @@ export const loadSettings = () => {
     // Settings from version 1: switch to the new built-in directions once.
     s.navApp = 'builtin';
     s.voice = true;
-    if (!['auto', 'streets', 'dark'].includes(s.mapStyle)) s.mapStyle = 'auto';
     delete s.cartoKey;
-    s.v = 2;
+  }
+  if (!saved.v || saved.v < 3) {
+    // Version 1.2: satellite map, curbside arrivals.
+    s.mapStyle = 'satellite';
+    s.curbside = true;
+    s.roadLines = true;
+    s.v = 3;
   }
   return s;
 };

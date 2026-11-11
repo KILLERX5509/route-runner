@@ -66,20 +66,53 @@ export function osrmGet(path, signal) {
 }
 export const coordPath = (pts) => pts.map((p) => `${(+p.lng).toFixed(6)},${(+p.lat).toFixed(6)}`).join(';');
 
-async function osrmTable(pts, signal) {
-  const j = await osrmGet(`/table/v1/driving/${coordPath(pts)}?annotations=duration,distance`, signal);
+// "curb" makes the router arrive with the stop on the passenger side (the right,
+// in the US), so you don't have to cross traffic. The first point (where you
+// are now) is left open.
+export const approaches = (n, curb, firstOpen = true) =>
+  (curb ? `&approaches=${[...Array(n).keys()].map((i) => (firstOpen && i === 0 ? '' : 'curb')).join(';')}` : '');
+
+async function osrmTable(pts, { curb, firstOpen } = {}, signal) {
+  const j = await osrmGet(`/table/v1/driving/${coordPath(pts)}?annotations=duration,distance${approaches(pts.length, curb, firstOpen)}`, signal);
   return { durations: j.durations, distances: j.distances };
 }
 
-async function osrmLine(pts, signal) {
-  const out = [];
+// Road shape through the points, plus where each leg starts in it.
+async function osrmLine(pts, { curb, firstOpen } = {}, signal) {
+  const coords = [];
+  const legStarts = [];
   for (let s = 0; s < pts.length - 1; s += 79) {
     const chunk = pts.slice(s, s + 80);
     if (chunk.length < 2) break;
-    const j = await osrmGet(`/route/v1/driving/${coordPath(chunk)}?overview=full&geometries=geojson`, signal);
-    out.push(...(j.routes?.[0]?.geometry?.coordinates || []));
+    const ap = approaches(chunk.length, curb, firstOpen && s === 0);
+    const j = await osrmGet(`/route/v1/driving/${coordPath(chunk)}?overview=full&geometries=geojson&annotations=distance${ap}`, signal);
+    const r = j.routes?.[0];
+    const g = r?.geometry?.coordinates || [];
+    const base = coords.length ? coords.length - 1 : 0;
+    // Each leg's distance annotation has one entry per segment, so legs line up with the geometry.
+    let idx = base;
+    for (const leg of r?.legs || []) {
+      legStarts.push(idx);
+      idx += leg.annotation?.distance?.length || 0;
+    }
+    coords.push(...(coords.length ? g.slice(1) : g));
   }
-  return out; // [lng, lat]
+  legStarts.push(coords.length - 1);
+  return { coords, legStarts }; // legStarts has one more entry than there are legs
+}
+
+// Which side of the road a stop is on when you arrive: 'right', 'left', or null.
+export function arrivalSide(coords, endIdx, stop) {
+  const end = coords[endIdx];
+  if (!end) return null;
+  const kx = Math.cos((end[1] * Math.PI) / 180) * 111320, ky = 110540;
+  let i = endIdx - 1;
+  while (i > 0 && Math.hypot((end[0] - coords[i][0]) * kx, (end[1] - coords[i][1]) * ky) < 4) i--;
+  if (i < 0) return null;
+  const dx = (end[0] - coords[i][0]) * kx, dy = (end[1] - coords[i][1]) * ky;
+  const vx = (stop.lng - end[0]) * kx, vy = (stop.lat - end[1]) * ky;
+  if (Math.hypot(dx, dy) < 1 || Math.hypot(vx, vy) < 1.5) return null;
+  return dx * vy - dy * vx > 0 ? 'left' : 'right';
 }
 
 /* --------------------------------------------- OpenRouteService (optional) */
@@ -154,7 +187,7 @@ async function orsLine(key, pts, signal) {
 /* ------------------------------------------------------ public routing API */
 
 // Drive-time matrix: free routing server, then OpenRouteService, then straight lines.
-export async function driveMatrix(pts, { orsKey, signal } = {}) {
+export async function driveMatrix(pts, { orsKey, signal, curb = false, firstOpen = true } = {}) {
   const fix = (m) => {
     const n = pts.length;
     for (let i = 0; i < n; i++) {
@@ -169,7 +202,7 @@ export async function driveMatrix(pts, { orsKey, signal } = {}) {
     return m;
   };
   let note = '';
-  try { return { ...fix(await osrmTable(pts, signal)), road: true }; } catch (e) {
+  try { return { ...fix(await osrmTable(pts, { curb, firstOpen }, signal)), road: true }; } catch (e) {
     if (e.name === 'AbortError') throw e;
     note = e.message;
   }
@@ -182,17 +215,74 @@ export async function driveMatrix(pts, { orsKey, signal } = {}) {
   return { ...straightMatrix(pts), note };
 }
 
-// Road-following line through the points. Returns [[lng, lat], ...] or [].
-export async function roadLine(pts, { orsKey, signal } = {}) {
-  try { return await osrmLine(pts, signal); } catch (e) {
+// Road-following line through the points.
+// Returns { coords: [[lng, lat], ...], legStarts: [...] | null }, coords empty if nothing worked.
+export async function roadLine(pts, { orsKey, signal, curb = false, firstOpen = true } = {}) {
+  try { return await osrmLine(pts, { curb, firstOpen }, signal); } catch (e) {
     if (e.name === 'AbortError') throw e;
   }
   if (orsKey) {
-    try { return await orsLine(orsKey, pts, signal); } catch (e) {
+    try { return { coords: await orsLine(orsKey, pts, signal), legStarts: null }; } catch (e) {
       if (e.name === 'AbortError') throw e;
     }
   }
-  return [];
+  return { coords: [], legStarts: null };
+}
+
+/* ------------------------------------- businesses already on OpenStreetMap */
+
+const OVERPASS = 'https://overpass-api.de/api/interpreter';
+const NAME_STOP = new Set(['the', 'and', 'of', 'llc', 'inc', 'pllc', 'ltd', 'co', 'corp', 'pc', 'pa', 'dba', 'at']);
+const nameWords = (s) => String(s || '').toLowerCase().replace(/&/g, ' and ').replace(/['’]/g, '')
+  .replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter((w) => w && !NAME_STOP.has(w));
+export function nameSimilarity(a, b) {
+  const A = new Set(nameWords(a)), B = new Set(nameWords(b));
+  if (!A.size || !B.size) return 0;
+  let shared = 0;
+  for (const w of A) if (B.has(w)) shared++;
+  return (2 * shared) / (A.size + B.size);
+}
+
+// Move pins onto the actual building when OpenStreetMap knows the business by
+// name nearby. Address lookups place a pin along the block; this puts it on the
+// right building, which also makes the "which side of the street" call reliable.
+export async function snapToBusinesses(stops, { signal } = {}) {
+  const pts = stops.filter((s) => s.lat != null && s.name);
+  if (!pts.length) return 0;
+  let s = 90, w = 180, n = -90, e = -180;
+  for (const p of pts) { s = Math.min(s, p.lat); n = Math.max(n, p.lat); w = Math.min(w, p.lng); e = Math.max(e, p.lng); }
+  if (n - s > 0.8 || e - w > 0.8) return 0; // too spread out for one lookup
+  const pad = 0.006;
+  const bb = `${(s - pad).toFixed(5)},${(w - pad).toFixed(5)},${(n + pad).toFixed(5)},${(e + pad).toFixed(5)}`;
+  const keys = ['shop', 'amenity', 'office', 'healthcare', 'tourism', 'craft', 'leisure'];
+  const q = `[out:json][timeout:25];(${keys.map((k) => `nwr["name"]["${k}"](${bb});`).join('')});out center tags;`;
+  let res;
+  try {
+    res = await fetch(OVERPASS, { method: 'POST', body: `data=${encodeURIComponent(q)}`, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal });
+  } catch (e2) {
+    if (e2.name === 'AbortError') throw e2;
+    return 0;
+  }
+  if (!res.ok) return 0;
+  const els = (await res.json()).elements || [];
+  const places = els.map((x) => ({ name: x.tags?.name, lat: x.lat ?? x.center?.lat, lng: x.lon ?? x.center?.lon })).filter((x) => x.name && x.lat != null);
+  let moved = 0;
+  for (const st of pts) {
+    let best = null;
+    for (const pl of places) {
+      const sim = nameSimilarity(st.name, pl.name);
+      if (sim < 0.66) continue;
+      const d = haversine(st, pl);
+      const ok = (sim >= 0.66 && d < 250) || (sim >= 0.85 && d < 700);
+      if (ok && (!best || sim > best.sim || (sim === best.sim && d < best.d))) best = { ...pl, sim, d };
+    }
+    if (best && best.d > 2) {
+      Object.assign(st, { lat: best.lat, lng: best.lng, precision: 'exact', geo: 'osm-poi' });
+      if (st.address) geocache_.set(st.address, { lat: best.lat, lng: best.lng, precision: 'exact', source: 'osm-poi' });
+      moved++;
+    }
+  }
+  return moved;
 }
 
 /* --------------------------------------------------------- address lookup */

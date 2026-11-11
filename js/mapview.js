@@ -1,20 +1,37 @@
-// The map: MapLibre GL (sharp vector map) with OpenFreeMap's free tiles.
-// Everything else in the app talks to the map through this small API.
+// The map: MapLibre GL with free tiles.
+//   satellite: USGS aerial imagery (public domain, no key) with street names on top.
+//              With a free ArcGIS key, Esri World Imagery instead (sharper up close).
+//   map:       OpenFreeMap "liberty" street map.
+//   dark:      OpenFreeMap dark street map.
 
 const ml = window.maplibregl;
 
-export const STYLES = {
+const VECTOR = {
   light: 'https://tiles.openfreemap.org/styles/liberty',
   dark: 'https://tiles.openfreemap.org/styles/dark',
 };
+const SAT = {
+  usgs: {
+    tiles: ['https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}'],
+    maxzoom: 16,
+    attribution: 'Imagery: USGS The National Map',
+  },
+  esri: (key) => ({
+    tiles: [`https://ibasemaps-api.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?token=${encodeURIComponent(key)}`],
+    maxzoom: 19,
+    attribution: 'Imagery: Esri, Vantor, Earthstar Geographics',
+  }),
+};
 
-const GREEN = '#0B6E4F';
-const BLUE = '#2F80ED';
+// Route colors, like Google Maps: dark blue for where you're headed now,
+// faded blue for the rest of the route.
+const CURRENT = '#3B2BEB', CURRENT_EDGE = '#17106E';
+const REST = '#8E9BFA', REST_EDGE = '#4C57C6';
 
-export function createMapView(container, { center, onPinTap, onMapTap, onLongPress, onUserMove }) {
+export function createMapView(container, { center, onPinTap, onMapTap, onLongPress, onUserMove, onSatelliteFail }) {
   const map = new ml.Map({
     container,
-    style: STYLES.light,
+    style: VECTOR.light,
     center: [center[1], center[0]],
     zoom: 12,
     attributionControl: false,
@@ -23,94 +40,114 @@ export function createMapView(container, { center, onPinTap, onMapTap, onLongPre
     touchPitch: false,
     maxPitch: 60,
     fadeDuration: 0,
-    cooperativeGestures: false,
   });
   map.touchZoomRotate.disableRotation();
   map.addControl(new ml.AttributionControl({ compact: true }), 'bottom-right');
 
-  let styleKey = 'light';
-  let routeData = { coords: [], kind: 'straight' };
-  let navData = { coords: [] };
+  let look = { kind: 'map', satKey: '' }; // what's showing now
+  let lines = { current: [], rest: [] };
   let pins = [];
-  let meMarker = null;
-  let meEl = null;
+  let meMarker = null, meEl = null;
   let navMode = false;
+  let satErrors = 0, satOk = false;
 
-  const empty = () => ({ type: 'FeatureCollection', features: [] });
-  const line = (coords, props = {}) => (coords.length >= 2
-    ? { type: 'FeatureCollection', features: [{ type: 'Feature', properties: props, geometry: { type: 'LineString', coordinates: coords } }] }
-    : empty());
+  const fc = (coords) => (coords && coords.length >= 2
+    ? { type: 'FeatureCollection', features: [{ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } }] }
+    : { type: 'FeatureCollection', features: [] });
 
   function firstSymbolLayer() {
-    const layers = map.getStyle()?.layers || [];
-    return layers.find((l) => l.type === 'symbol')?.id;
+    return (map.getStyle()?.layers || []).find((l) => l.type === 'symbol')?.id;
+  }
+
+  // Turn the street map into "satellite with labels".
+  function makeHybrid() {
+    const layers = map.getStyle().layers || [];
+    const src = look.satKey ? SAT.esri(look.satKey) : SAT.usgs;
+    const firstReal = layers.find((l) => l.type !== 'background')?.id;
+    map.addSource('rr-sat', { type: 'raster', tiles: src.tiles, tileSize: 256, maxzoom: src.maxzoom, attribution: src.attribution });
+    map.addLayer({ id: 'rr-sat', type: 'raster', source: 'rr-sat', paint: { 'raster-fade-duration': 0 } }, firstReal);
+    for (const l of layers) {
+      try {
+        if (['background', 'fill', 'fill-extrusion', 'raster', 'hillshade', 'heatmap'].includes(l.type)) {
+          map.setLayoutProperty(l.id, 'visibility', 'none');
+        } else if (l.type === 'line') {
+          if (l['source-layer'] === 'transportation') map.setPaintProperty(l.id, 'line-opacity', 0.28);
+          else map.setLayoutProperty(l.id, 'visibility', 'none');
+        } else if (l.type === 'symbol' && l.layout?.['text-field']) {
+          map.setPaintProperty(l.id, 'text-color', '#ffffff');
+          map.setPaintProperty(l.id, 'text-halo-color', 'rgba(0,0,0,0.85)');
+          map.setPaintProperty(l.id, 'text-halo-width', 1.6);
+        }
+      } catch { /* a layer that doesn't take that property */ }
+    }
+    satErrors = 0;
+    satOk = false;
   }
 
   function install() {
-    if (!map.getSource('rr-route')) {
-      const before = firstSymbolLayer();
-      map.addSource('rr-route', { type: 'geojson', data: line(routeData.coords, { kind: routeData.kind }) });
-      map.addSource('rr-nav', { type: 'geojson', data: line(navData.coords) });
-      map.addLayer({ id: 'rr-route-casing', type: 'line', source: 'rr-route', filter: ['==', ['get', 'kind'], 'road'],
-        layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ffffff', 'line-width': 8, 'line-opacity': 0.9 } }, before);
-      map.addLayer({ id: 'rr-route-road', type: 'line', source: 'rr-route', filter: ['==', ['get', 'kind'], 'road'],
-        layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': GREEN, 'line-width': 5 } }, before);
-      map.addLayer({ id: 'rr-route-dots', type: 'line', source: 'rr-route', filter: ['==', ['get', 'kind'], 'straight'],
-        layout: { 'line-cap': 'round' }, paint: { 'line-color': GREEN, 'line-width': 5, 'line-dasharray': [0.1, 2.2] } }, before);
-      map.addLayer({ id: 'rr-nav-casing', type: 'line', source: 'rr-nav',
-        layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#1A4F9C', 'line-width': 13 } }, before);
-      map.addLayer({ id: 'rr-nav-line', type: 'line', source: 'rr-nav',
-        layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': BLUE, 'line-width': 9 } }, before);
-    }
+    if (look.kind === 'satellite') makeHybrid();
+    if (map.getSource('rr-rest')) return;
+    const before = firstSymbolLayer();
+    map.addSource('rr-rest', { type: 'geojson', data: fc(lines.rest) });
+    map.addSource('rr-current', { type: 'geojson', data: fc(lines.current) });
+    const round = { 'line-join': 'round', 'line-cap': 'round' };
+    map.addLayer({ id: 'rr-rest-edge', type: 'line', source: 'rr-rest', layout: round, paint: { 'line-color': REST_EDGE, 'line-width': 9, 'line-opacity': 0.75 } }, before);
+    map.addLayer({ id: 'rr-rest', type: 'line', source: 'rr-rest', layout: round, paint: { 'line-color': REST, 'line-width': 6 } }, before);
+    map.addLayer({ id: 'rr-current-edge', type: 'line', source: 'rr-current', layout: round, paint: { 'line-color': CURRENT_EDGE, 'line-width': 11 } }, before);
+    map.addLayer({ id: 'rr-current', type: 'line', source: 'rr-current', layout: round, paint: { 'line-color': CURRENT, 'line-width': 7.5 } }, before);
   }
   map.on('style.load', install);
+  // Keep the map credits as a small (i) button until tapped.
+  map.once('load', () => {
+    container.querySelector('.maplibregl-ctrl-attrib')?.classList.remove('maplibregl-compact-show');
+  });
 
-  function setStyle(dark) {
-    const key = dark ? 'dark' : 'light';
-    if (key === styleKey) return;
-    styleKey = key;
-    map.setStyle(STYLES[key], { diff: false });
+  // If the imagery won't load, fall back to the street map instead of a blank screen.
+  map.on('error', (e) => {
+    if (e?.sourceId !== 'rr-sat' || satOk) return;
+    if (++satErrors === 10) onSatelliteFail?.();
+  });
+  map.on('sourcedata', (e) => { if (e.sourceId === 'rr-sat' && e.tile) satOk = true; });
+
+  function setLook(kind, satKey = '') {
+    if (look.kind === kind && look.satKey === satKey) return;
+    look = { kind, satKey };
+    map.setStyle(kind === 'dark' ? VECTOR.dark : VECTOR.light, { diff: false });
   }
 
-  // Pins are plain HTML elements so they look exactly like the rest of the app.
+  // Teardrop pins: the number sits in the round head, the tip marks the exact spot.
   function setPins(list) {
     for (const p of pins) p.marker.remove();
     pins = [];
-    // Added in order so later ones sit on top: done, then upcoming (last first), then next.
     const order = [...list].sort((a, b) => a.z - b.z);
     for (const p of order) {
       const el = document.createElement('button');
       el.type = 'button';
-      el.className = 'pin-wrap';
+      el.className = `pin-wrap ${p.wrapCls || ''}`;
       el.setAttribute('aria-label', p.label);
       el.innerHTML = `<div class="${p.cls}"><span>${p.num}</span></div>`;
       el.addEventListener('click', (e) => { e.stopPropagation(); onPinTap?.(p.id); });
-      const marker = new ml.Marker({ element: el, anchor: 'center' }).setLngLat([p.lng, p.lat]).addTo(map);
+      const marker = new ml.Marker({ element: el, anchor: 'bottom' }).setLngLat([p.lng, p.lat]).addTo(map);
       pins.push({ id: p.id, marker });
     }
   }
 
-  function setRouteLine(coords, kind) {
-    routeData = { coords, kind };
-    map.getSource('rr-route')?.setData(line(coords, { kind }));
+  function setRoute({ current = [], rest = [] }) {
+    lines = { current, rest };
+    map.getSource('rr-current')?.setData(fc(current));
+    map.getSource('rr-rest')?.setData(fc(rest));
   }
 
-  function setNavLine(coords) {
-    navData = { coords };
-    map.getSource('rr-nav')?.setData(line(coords));
-  }
-
-  function setMe(me, heading) {
-    if (!me) return;
+  function setMe(p) {
+    if (!p) return;
     if (!meMarker) {
       meEl = document.createElement('div');
       meEl.className = 'me';
-      meEl.innerHTML = '<div class="me-dot"></div><svg class="me-arrow" viewBox="0 0 40 40" aria-hidden="true"><path d="M20 4 33 34 20 27 7 34z"/></svg>';
-      meMarker = new ml.Marker({ element: meEl, anchor: 'center', rotationAlignment: 'map', pitchAlignment: 'map' })
-        .setLngLat([me.lng, me.lat]).addTo(map);
+      meEl.innerHTML = '<div class="me-dot"></div><svg class="me-arrow" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 4 40 42 24 33 8 42z"/></svg>';
+      meMarker = new ml.Marker({ element: meEl, anchor: 'center', rotationAlignment: 'viewport', pitchAlignment: 'map' })
+        .setLngLat([p.lng, p.lat]).addTo(map);
     }
-    meMarker.setLngLat([me.lng, me.lat]);
-    if (Number.isFinite(heading)) meMarker.setRotation(heading);
+    meMarker.setLngLat([p.lng, p.lat]);
   }
 
   function fit(points, padding) {
@@ -125,21 +162,21 @@ export function createMapView(container, { center, onPinTap, onMapTap, onLongPre
     map.easeTo({ center: [p.lng, p.lat], zoom: zoom ?? Math.max(map.getZoom(), 14), padding, duration: 500 });
   }
 
+  // Heading-up driving view: the map turns so the road ahead points up the screen.
   function follow(p, { bearing, zoom, padding }) {
-    map.easeTo({ center: [p.lng, p.lat], bearing, zoom, pitch: 50, padding, duration: 900, easing: (t) => t });
+    map.easeTo({ center: [p.lng, p.lat], bearing, zoom, pitch: 45, padding, duration: 950, easing: (t) => t });
   }
 
   function setNavMode(on) {
     navMode = on;
     meEl?.classList.toggle('is-nav', on);
-    if (on) { map.touchZoomRotate.enableRotation(); }
+    if (on) map.touchZoomRotate.enableRotation();
     else {
       map.touchZoomRotate.disableRotation();
       map.easeTo({ bearing: 0, pitch: 0, duration: 500 });
     }
   }
 
-  // Taps, long-presses, and "the user moved the map".
   map.on('click', (e) => onMapTap?.({ lat: e.lngLat.lat, lng: e.lngLat.lng }));
   map.on('contextmenu', (e) => onLongPress?.({ lat: e.lngLat.lat, lng: e.lngLat.lng }));
   let press = null;
@@ -157,10 +194,9 @@ export function createMapView(container, { center, onPinTap, onMapTap, onLongPre
 
   return {
     map,
-    setStyle,
+    setLook,
     setPins,
-    setRouteLine,
-    setNavLine,
+    setRoute,
     setMe,
     fit,
     focus,
@@ -170,5 +206,6 @@ export function createMapView(container, { center, onPinTap, onMapTap, onLongPre
     getZoom: () => map.getZoom(),
     resize: () => map.resize(),
     isNav: () => navMode,
+    look: () => look.kind,
   };
 }

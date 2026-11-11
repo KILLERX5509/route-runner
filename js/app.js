@@ -1,11 +1,11 @@
 import { solveRoute, routeCost } from './optimizer.js';
 import { FIELDS, parseFile, parseDelimited, detectColumns, buildStops, needsArea, cleanAddress } from './importer.js';
-import { geocodeStops, geocodeOne, driveMatrix, roadLine, haversine, testOrsKey } from './services.js';
+import { geocodeStops, geocodeOne, driveMatrix, roadLine, haversine, testOrsKey, arrivalSide, snapToBusinesses } from './services.js';
 import { createMapView } from './mapview.js';
 import { createNavigator } from './nav.js';
 import * as store from './store.js';
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -111,15 +111,23 @@ function openRoute(id) {
   setSheet('peek');
   fitAll();
   maybeRoadLine();
+  snapPinsOnce(state.route);
 }
 
 /* ---------------------------------------------------------------------- map */
 
 const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
-const isDark = () => (state.settings.mapStyle === 'auto' ? darkQuery.matches : state.settings.mapStyle === 'dark');
+const mapLook = () => (['satellite', 'map', 'dark'].includes(state.settings.mapStyle) ? state.settings.mapStyle : 'satellite');
 
 const mv = createMapView($('#map'), {
   center: DEFAULT_CENTER,
+  onSatelliteFail: () => {
+    if (mapLook() !== 'satellite') return;
+    mv.setLook('map');
+    toast(state.settings.satKey
+      ? "Satellite imagery didn't load. Check the ArcGIS key in Settings. Showing the street map for now."
+      : "Satellite imagery didn't load, so the street map is showing for now.", { duration: 7000 });
+  },
   onPinTap: (id) => {
     if (state.placing || nav.isActive()) return;
     state.selectedId = id;
@@ -146,9 +154,10 @@ const mv = createMapView($('#map'), {
 });
 
 function applyTheme() {
-  const dark = isDark();
+  const look = mapLook();
+  const dark = look === 'dark' || (look === 'satellite' && darkQuery.matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-  mv.setStyle(dark);
+  mv.setLook(look, (state.settings.satKey || '').trim());
 }
 darkQuery.addEventListener?.('change', applyTheme);
 
@@ -161,14 +170,15 @@ function renderMarkers() {
     if (s.lat == null) return;
     const isNext = s === next;
     const cls = ['pin'];
-    if (isNext) cls.push('is-next');
-    else if (s.status === 'done') cls.push('is-done');
+    let wrap = '';
+    if (isNext) { cls.push('is-next'); wrap = 'is-big'; }
+    else if (s.status === 'done') { cls.push('is-done'); wrap = 'is-small'; }
     else if (s.status === 'skipped') cls.push('is-skipped');
     else if (s.precision && s.precision !== 'exact') cls.push('is-approx');
     if (String(i + 1).length >= 3) cls.push('is-long');
     if (s.id === state.selectedId) cls.push('is-selected');
     list.push({
-      id: s.id, lat: s.lat, lng: s.lng, num: i + 1, cls: cls.join(' '),
+      id: s.id, lat: s.lat, lng: s.lng, num: i + 1, cls: cls.join(' '), wrapCls: wrap,
       z: isNext ? 1e6 : s.status === 'todo' ? 1e5 - i : i,
       label: `Stop ${i + 1}, ${s.name}`,
     });
@@ -176,15 +186,30 @@ function renderMarkers() {
   mv.setPins(list);
 }
 
+// The route on the roads: dark blue from you to the next stop, faded blue after that.
 function renderLine() {
+  if (nav.isActive()) return; // navigation draws its own lines
   const r = state.route;
-  if (!r || nav.isActive()) { mv.setRouteLine([], 'straight'); return; }
-  const todo = todoStops(r);
-  if (!todo.length) { mv.setRouteLine([], 'straight'); return; }
-  if (state.roadLine && state.roadSig === routeSig(r)) { mv.setRouteLine(state.roadLine, 'road'); return; }
-  const pts = todo.map((s) => [s.lng, s.lat]);
-  if (state.me) pts.unshift([state.me.lng, state.me.lat]);
-  mv.setRouteLine(pts.length >= 2 ? pts : [], 'straight');
+  const line = state.roadLine;
+  if (!r || !state.settings.roadLines || !line || state.roadSig !== routeSig(r) || !line.coords.length) {
+    mv.setRoute({ current: [], rest: [] });
+    return;
+  }
+  if (line.hasMe && line.legStarts) {
+    const cut = line.legStarts[1];
+    mv.setRoute({ current: line.coords.slice(0, cut + 1), rest: line.coords.slice(cut) });
+  } else {
+    mv.setRoute({ current: [], rest: line.coords });
+  }
+}
+
+// For navigation: the faded line from a given stop onward.
+function restAfter(stop) {
+  const line = state.roadLine;
+  if (!line?.legStarts || !line.ids || !state.settings.roadLines) return [];
+  const j = line.ids.indexOf(stop.id);
+  if (j < 0) return [];
+  return line.coords.slice(line.legStarts[j]);
 }
 
 let roadAbort = null, roadTimer = null;
@@ -192,26 +217,56 @@ function scheduleRoadLine() {
   clearTimeout(roadTimer);
   roadTimer = setTimeout(maybeRoadLine, 1200);
 }
-async function maybeRoadLine() {
+async function maybeRoadLine({ force = false } = {}) {
   const r = state.route;
-  if (!r || !state.settings.roadLines) return;
+  if (!r) return;
   const sig = routeSig(r);
-  if (state.roadLine && state.roadSig === sig) return;
-  const pts = todoStops(r).map((s) => ({ lat: s.lat, lng: s.lng }));
-  if (state.me) pts.unshift({ lat: state.me.lat, lng: state.me.lng });
-  if (pts.length < 2) return;
+  if (!force && state.roadLine && state.roadSig === sig) return;
+  const todo = todoStops(r);
+  const pts = todo.map((s) => ({ lat: s.lat, lng: s.lng, id: s.id }));
+  const me = state.me;
+  if (me) pts.unshift({ lat: me.lat, lng: me.lng, id: null });
+  if (pts.length < 2) { state.roadLine = null; renderLine(); return; }
   roadAbort?.abort();
   roadAbort = new AbortController();
   try {
-    const line = await roadLine(pts, { orsKey: state.settings.orsKey, signal: roadAbort.signal });
-    if (line.length && state.route === r && routeSig(r) === sig) {
-      state.roadLine = line;
-      state.roadSig = sig;
-      renderLine();
+    const curb = state.settings.curbside !== false;
+    const res = await roadLine(pts, { orsKey: state.settings.orsKey, signal: roadAbort.signal, curb, firstOpen: !!me });
+    if (!res.coords.length || state.route !== r || routeSig(r) !== sig) return;
+    state.roadLine = { ...res, hasMe: !!me, ids: pts.map((p) => p.id), at: me ? { lat: me.lat, lng: me.lng } : null, t: Date.now() };
+    state.roadSig = sig;
+    // Which side of the street each stop is on when you pull up.
+    if (res.legStarts) {
+      pts.forEach((p, j) => {
+        if (j === 0 || !p.id) return;
+        const s = findStop(p.id);
+        if (s) s.side = arrivalSide(res.coords, res.legStarts[j], s);
+      });
+      saveRoute(false);
     }
+    renderLine();
+    renderSheet();
   } catch (e) {
     if (e.name !== 'AbortError') console.warn('Road line failed:', e.message);
   }
+}
+
+// Business locations from OpenStreetMap, checked once per route.
+async function snapPinsOnce(r) {
+  if (!r || r.poiChecked) return;
+  const mapped = r.stops.filter((s) => s.lat != null && s.status !== 'done' && s.geo !== 'manual' && s.geo !== 'osm-poi');
+  r.poiChecked = true;
+  if (!mapped.length) { saveRoute(false); return; }
+  try {
+    const moved = await snapToBusinesses(mapped);
+    saveRoute(false);
+    if (moved && state.route === r) {
+      state.roadLine = null;
+      renderAll();
+      maybeRoadLine();
+      toast(`Moved ${moved} ${moved === 1 ? 'pin' : 'pins'} onto the business building from the map data.`);
+    }
+  } catch { /* offline: try again next time */ r.poiChecked = false; }
 }
 
 function topInset() {
@@ -244,10 +299,12 @@ function setMe(p) {
   const moved = !state.me || haversine(state.me, me) > 25;
   state.me = me;
   if (nav.isActive()) { nav.onFix(me); return; }
-  mv.setMe(me, null);
-  if (moved) {
-    updateNextDistance();
-    renderLine();
+  mv.setMe(me);
+  if (moved) updateNextDistance();
+  // Keep the dark blue "from you" line current as you move around.
+  const line = state.roadLine;
+  if (state.route && (!line || (line.at ? haversine(line.at, me) > 250 && Date.now() - line.t > 30000 : !line.hasMe))) {
+    maybeRoadLine({ force: true });
   }
   if (state.following) mv.focus(me, undefined, mapPadding());
 }
@@ -294,6 +351,12 @@ function updateNextDistance() {
 const nav = createNavigator({
   mapview: mv,
   getMe: () => state.me,
+  getRest: (stop) => restAfter(stop),
+  getNext: (stop) => {
+    const r = state.route;
+    const next = r?.stops.find((s) => s !== stop && s.status === 'todo' && s.lat != null);
+    return next ? { num: numOf(next), name: next.name } : null;
+  },
   settings: () => state.settings,
   onChange: () => saveSettings(),
   fallbackNav: (s) => openExternal(s, 'apple'),
@@ -312,6 +375,8 @@ const nav = createNavigator({
   },
   onEnd: () => {
     document.body.classList.remove('is-nav');
+    state.roadLine = null;
+    maybeRoadLine();
     renderAll();
     setSheet('peek');
     if (state.me) focusOn(state.me, 15);
@@ -330,7 +395,6 @@ async function startNav(s) {
   startWatch();
   document.body.classList.add('is-nav');
   state.following = false;
-  renderLine();
   nav.start(s, numOf(s));
 }
 
@@ -483,7 +547,7 @@ function routeHTML(r) {
         </div>
         ${next.notes ? `<p class="notes">${esc(next.notes)}</p>` : ''}
         <div class="sign-foot">
-          <span class="sign-away" id="next-away">${next.leg ? `${fmtDur(next.leg.sec)} drive` : ''}</span>
+          <span class="sign-away"><span id="next-away">${next.leg ? `${fmtDur(next.leg.sec)} drive` : ''}</span>${next.side ? `<span class="sign-side">On your ${next.side}</span>` : ''}</span>
           <div class="sign-actions">
             <button class="btn btn-sign-primary" type="button" data-action="navigate" data-id="${next.id}">${ICON.nav}Go</button>
             <button class="btn btn-sign" id="next-done" type="button" data-action="done" data-id="${next.id}">Done</button>
@@ -509,7 +573,8 @@ function routeHTML(r) {
     else if (s.lat == null) { cls.push('is-missing'); side = 'Not on map'; }
     else if (s.leg && !r.legsStale) side = fmtDur(s.leg.sec);
     if (s.id === state.selectedId) cls.push('is-selected');
-    const tag = s.status === 'todo' && s.lat != null && s.precision && s.precision !== 'exact' ? '<span class="tag">Approx.</span>' : '';
+    let tag = s.status === 'todo' && s.lat != null && s.precision && s.precision !== 'exact' ? '<span class="tag">Approx.</span>' : '';
+    if (s.status === 'todo' && s.side) tag += `<span class="tag ${s.side === 'left' ? 'is-left' : 'is-right'}">${s.side === 'left' ? 'Left side' : 'Right side'}</span>`;
     const checkLabel = s.status === 'done' ? `Mark stop ${i + 1} not done` : s.status === 'skipped' ? `Put stop ${i + 1} back` : `Mark stop ${i + 1} done`;
     return `<li class="${cls.join(' ')}">
       <button class="stop-main" type="button" data-action="stop" data-id="${s.id}">
@@ -835,7 +900,7 @@ async function optimize() {
   const pts = start ? [{ lat: start.lat, lng: start.lng }, ...todo] : todo.slice();
   busy('Getting drive times');
   const mat = pts.length > 1
-    ? await driveMatrix(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { orsKey: state.settings.orsKey })
+    ? await driveMatrix(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { orsKey: state.settings.orsKey, curb: state.settings.curbside !== false, firstOpen: !!start })
     : { durations: [[0]], distances: [[0]], road: false };
 
   busy('Optimizing');
@@ -1041,6 +1106,11 @@ async function geocodeFlow(r, onlyStops = null, { before } = {}) {
       const t = $('#gc-now'); if (t) t.textContent = s.lat != null ? `Found ${s.name}` : `Couldn't find ${s.name}`;
     },
   });
+  if (!ctrl.signal.aborted) {
+    const t = $('#gc-now'); if (t) t.textContent = 'Matching businesses to their buildings';
+    try { await snapToBusinesses(need.filter((s) => s.lat != null), { signal: ctrl.signal }); } catch { /* skip */ }
+    r.poiChecked = true;
+  }
   state.gcAbort = null;
   before?.();
   saveRoute();
@@ -1053,6 +1123,7 @@ function afterImport(r) {
   state.roadLine = null;
   state.roadSig = '';
   renderAll();
+  maybeRoadLine();
   setSheet('peek');
   setTimeout(fitAll, 60);
   const missing = r.stops.filter((s) => s.lat == null).length;
@@ -1317,6 +1388,8 @@ function settingsScreen() {
       ${seg('navApp', s.navApp || 'builtin', [['builtin', 'In this app'], ['apple', 'Apple'], ['google', 'Google'], ['waze', 'Waze']])}
       <p class="hint">"In this app" gives turn-by-turn directions right here. The others hand each stop to that app (Google Maps and Waze need their apps installed).</p>
       <label class="check-row" style="margin-top:6px"><input type="checkbox" id="set-voice" ${s.voice ? 'checked' : ''}> Spoken directions</label>
+      <label class="check-row"><input type="checkbox" id="set-curb" ${s.curbside !== false ? 'checked' : ''}> Arrive with stops on my right</label>
+      <p class="hint" style="margin-top:0">Plans each approach so you pull up on the business's side of the road and don't have to cross traffic. It can add a short loop around a block.</p>
     </div>
     <div class="section">
       <h2>Where the route ends</h2>
@@ -1324,9 +1397,10 @@ function settingsScreen() {
     </div>
     <div class="section">
       <h2>Map look</h2>
-      ${seg('mapStyle', ['auto', 'streets', 'dark'].includes(s.mapStyle) ? s.mapStyle : 'auto', [['auto', 'Auto'], ['streets', 'Light'], ['dark', 'Dark']])}
-      <p class="hint">Auto switches to dark when your phone is in dark mode.</p>
-      <label class="check-row" style="margin-top:6px"><input type="checkbox" id="set-roadlines" ${s.roadLines ? 'checked' : ''}> Draw the route along roads</label>
+      ${seg('mapStyle', mapLook(), [['satellite', 'Satellite'], ['map', 'Map'], ['dark', 'Dark']])}
+      <label class="check-row" style="margin-top:6px"><input type="checkbox" id="set-roadlines" ${s.roadLines ? 'checked' : ''}> Show the route on the map</label>
+      <label class="field" style="margin-top:10px"><span>Sharper satellite (optional)</span><input class="input" id="set-satkey" value="${esc(s.satKey || '')}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ArcGIS API key"></label>
+      <p class="hint" style="margin-top:-6px">Satellite uses free U.S. government aerial photos, which get soft when you zoom in close. For sharper imagery, make a free ArcGIS Location Platform account at <a href="https://developers.arcgis.com/sign-up/" target="_blank" rel="noopener">developers.arcgis.com</a>, create an API key with basemap access, and paste it here.</p>
     </div>
     <div class="section">
       <h2>Your area</h2>
@@ -1357,11 +1431,19 @@ function settingsScreen() {
     if (e.target.name === 'mapStyle') applyTheme();
   }));
   $('#set-voice').addEventListener('change', (e) => { state.settings.voice = e.target.checked; saveSettings(); });
+  $('#set-curb').addEventListener('change', (e) => {
+    state.settings.curbside = e.target.checked;
+    saveSettings();
+    state.roadLine = null;
+    maybeRoadLine();
+    toast('Saved. Tap Optimize to re-plan the order with this setting.');
+  });
+  $('#set-satkey').addEventListener('change', (e) => { state.settings.satKey = e.target.value.trim(); saveSettings(); applyTheme(); });
   $('#set-key').addEventListener('change', (e) => { state.settings.orsKey = e.target.value.trim(); saveSettings(); });
   $('#set-roadlines').addEventListener('change', (e) => {
     state.settings.roadLines = e.target.checked;
     saveSettings();
-    if (!e.target.checked) { state.roadLine = null; state.roadSig = ''; renderLine(); } else maybeRoadLine();
+    renderLine(); if (e.target.checked) maybeRoadLine();
   });
   $('#set-area').addEventListener('change', (e) => { state.settings.areaHint = e.target.value.trim(); saveSettings(); });
 }
@@ -1529,7 +1611,7 @@ document.addEventListener('visibilitychange', () => {
 applyTheme();
 state.route = state.routes.find((r) => r.id === store.loadCurrentId()) || null;
 renderAll();
-requestAnimationFrame(() => { setSheet('peek', false); fitAll(); maybeRoadLine(); });
+requestAnimationFrame(() => { setSheet('peek', false); fitAll(); maybeRoadLine(); snapPinsOnce(state.route); });
 
 navigator.permissions?.query({ name: 'geolocation' }).then((p) => { if (p.state === 'granted') startWatch(); }).catch(() => {});
 
