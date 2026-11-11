@@ -54,6 +54,8 @@ button svg { width: 22px; height: 22px; flex: none; }
 #map { position: absolute; inset: 0; background: #E6E9E7; }
 :root[data-theme='dark'] #map { background: #1b1f22; }
 .leaflet-container { font-family: inherit; }
+/* Night look for OpenStreetMap tiles, which only come in a light style */
+#map.dark-tiles .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(.92) contrast(.9) saturate(.65); }
 .leaflet-control-attribution { font-size: 10px; margin-bottom: calc(var(--attr-offset, 0px)) !important; }
 
 /* ---------- top bar and map buttons ---------- */

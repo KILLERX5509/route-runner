@@ -67,4 +67,5 @@ the next time it opens with a signal. Your routes on the phone aren't affected.
 - `sw.js`, `manifest.webmanifest`, `icons/`: home screen app and offline support
 - `lib/leaflet` (map library, BSD-2), `fonts/` (Overpass, SIL Open Font License)
 
-Map data © OpenStreetMap contributors. Map tiles by CARTO.
+Map data and tiles © OpenStreetMap contributors. If you add a free CARTO key
+in Settings, the map uses CARTO's tiles instead.

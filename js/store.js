@@ -11,7 +11,8 @@ export const DEFAULT_SETTINGS = {
   orsKey: '',
   navApp: 'apple',      // apple | google | waze
   endMode: 'open',      // open | return
-  mapStyle: 'auto',     // auto | streets | dark | osm
+  mapStyle: 'auto',     // auto | streets | dark
+  cartoKey: '',         // optional; without it the map uses OpenStreetMap tiles
   areaHint: '',
   roadLines: true,
 };

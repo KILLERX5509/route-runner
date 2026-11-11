@@ -3,7 +3,7 @@ import { FIELDS, parseFile, parseDelimited, detectColumns, buildStops, needsArea
 import { geocodeStops, geocodeText, orsMatrix, orsRoadLine, straightMatrix, haversine, testOrsKey } from './services.js';
 import * as store from './store.js';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const L = window.L;
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -110,28 +110,46 @@ function openRoute(id) {
 const map = L.map('map', { zoomControl: false, tapHold: true, worldCopyJump: true }).setView(DEFAULT_CENTER, 12);
 map.attributionControl.setPrefix(false);
 
-const CARTO = { subdomains: 'abcd', maxZoom: 20, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> © <a href="https://carto.com/attributions">CARTO</a>' };
-const TILES = {
-  streets: { url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', opts: CARTO },
-  dark: { url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', opts: CARTO },
-  osm: { url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', opts: { maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' } },
-};
+// Map images. OpenStreetMap's tiles need no key. CARTO's cleaner styles are
+// used only if you add their free key in Settings.
+const OSM_ATTR = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
 let tileLayer = null, tileKey = '';
 const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+function tileSource(style) {
+  const key = (state.settings.cartoKey || '').trim();
+  if (key) {
+    const name = style === 'dark' ? 'dark_all' : 'voyager';
+    return {
+      id: `carto-${name}-${key}`,
+      url: `https://{s}.basemaps.cartocdn.com/rastertiles/${name}/{z}/{x}/{y}.png?key=${encodeURIComponent(key)}`,
+      opts: { subdomains: 'abcd', maxZoom: 20, attribution: `${OSM_ATTR} © <a href="https://carto.com/attributions">CARTO</a>` },
+      darkFilter: false,
+    };
+  }
+  return {
+    id: 'osm',
+    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    opts: { maxZoom: 19, attribution: OSM_ATTR },
+    darkFilter: style === 'dark',
+  };
+}
 
 function effectiveStyle() {
   const s = state.settings.mapStyle;
   if (s === 'auto') return darkQuery.matches ? 'dark' : 'streets';
-  return TILES[s] ? s : 'streets';
+  return s === 'dark' ? 'dark' : 'streets';
 }
 function applyTheme() {
   const st = effectiveStyle();
   document.documentElement.dataset.theme = st === 'dark' ? 'dark' : 'light';
-  if (st !== tileKey) {
+  const src = tileSource(st);
+  if (src.id !== tileKey) {
     tileLayer?.remove();
-    tileLayer = L.tileLayer(TILES[st].url, TILES[st].opts).addTo(map);
-    tileKey = st;
+    tileLayer = L.tileLayer(src.url, src.opts).addTo(map);
+    tileKey = src.id;
   }
+  map.getContainer().classList.toggle('dark-tiles', src.darkFilter);
 }
 darkQuery.addEventListener?.('change', applyTheme);
 
@@ -1276,8 +1294,10 @@ function settingsScreen() {
     </div>
     <div class="section">
       <h2>Map look</h2>
-      ${seg('mapStyle', s.mapStyle, [['auto', 'Auto'], ['streets', 'Light'], ['dark', 'Dark'], ['osm', 'Classic']])}
+      ${seg('mapStyle', s.mapStyle === 'osm' ? 'streets' : s.mapStyle, [['auto', 'Auto'], ['streets', 'Light'], ['dark', 'Dark']])}
       <p class="hint">Auto switches to dark when your phone is in dark mode.</p>
+      <label class="field" style="margin-top:14px"><span>CARTO map key (optional)</span><input class="input" id="set-carto" value="${esc(s.cartoKey || '')}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Leave empty to use OpenStreetMap"></label>
+      <p class="hint" style="margin-top:-6px">The map works without this. A free key from <a href="https://carto.com/basemaps/apikey" target="_blank" rel="noopener">carto.com/basemaps/apikey</a> (no account needed) switches to a cleaner, more muted map style.</p>
     </div>
     <div class="section">
       <h2>Real drive times (optional, free)</h2>
@@ -1301,7 +1321,7 @@ function settingsScreen() {
     </div>
     <div class="section">
       <h2>About</h2>
-      <p class="hint">Route Runner ${APP_VERSION}. Map data © OpenStreetMap contributors. Map tiles by CARTO. Address lookup by Nominatim and OpenRouteService. Maps drawn with Leaflet. Excel files read with SheetJS.</p>
+      <p class="hint">Route Runner ${APP_VERSION}. Map data and tiles © OpenStreetMap contributors (CARTO tiles when a CARTO key is added). Address lookup by Nominatim and OpenRouteService. Maps drawn with Leaflet. Excel files read with SheetJS.</p>
     </div>`, { left: 'Done' });
 
   document.querySelectorAll('#screen input[type=radio]').forEach((el) => el.addEventListener('change', (e) => {
@@ -1309,6 +1329,11 @@ function settingsScreen() {
     saveSettings();
     if (e.target.name === 'mapStyle') applyTheme();
   }));
+  $('#set-carto').addEventListener('change', (e) => {
+    state.settings.cartoKey = e.target.value.trim();
+    saveSettings();
+    applyTheme();
+  });
   $('#set-key').addEventListener('change', (e) => {
     state.settings.orsKey = e.target.value.trim();
     saveSettings();

@@ -2,7 +2,7 @@
 // falling back to the saved copy when there's no signal. Map tiles and the
 // Excel reader: saved copy first.
 
-const VERSION = 'rr-1.0.0';
+const VERSION = 'rr-1.0.1';
 const SHELL = [
   './',
   './index.html',
@@ -21,7 +21,7 @@ const SHELL = [
   './icons/icon-192.png',
   './icons/apple-touch-icon.png',
 ];
-const TILE_CACHE = 'rr-tiles';
+const TILE_CACHE = 'rr-tiles-2'; // new name drops any watermarked tiles saved by 1.0.0
 const LIB_CACHE = 'rr-libs';
 const TILE_MAX = 2500;
 const TILE_HOSTS = ['basemaps.cartocdn.com', 'tile.openstreetmap.org'];
