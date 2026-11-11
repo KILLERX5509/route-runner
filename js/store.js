@@ -8,11 +8,12 @@ const K_GEOCACHE = 'rr.geocache.v1';
 const GEOCACHE_MAX = 3000;
 
 export const DEFAULT_SETTINGS = {
+  v: 2,
   orsKey: '',
-  navApp: 'apple',      // apple | google | waze
+  navApp: 'builtin',    // builtin | apple | google | waze
+  voice: true,
   endMode: 'open',      // open | return
   mapStyle: 'auto',     // auto | streets | dark
-  cartoKey: '',         // optional; without it the map uses OpenStreetMap tiles
   areaHint: '',
   roadLines: true,
 };
@@ -36,7 +37,19 @@ function write(key, value) {
   }
 }
 
-export const loadSettings = () => ({ ...DEFAULT_SETTINGS, ...read(K_SETTINGS, {}) });
+export const loadSettings = () => {
+  const saved = read(K_SETTINGS, {});
+  const s = { ...DEFAULT_SETTINGS, ...saved };
+  if (!saved.v) {
+    // Settings from version 1: switch to the new built-in directions once.
+    s.navApp = 'builtin';
+    s.voice = true;
+    if (!['auto', 'streets', 'dark'].includes(s.mapStyle)) s.mapStyle = 'auto';
+    delete s.cartoKey;
+    s.v = 2;
+  }
+  return s;
+};
 export const saveSettings = (s) => write(K_SETTINGS, s);
 
 export const loadRoutes = () => {

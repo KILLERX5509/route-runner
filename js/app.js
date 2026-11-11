@@ -1,10 +1,11 @@
 import { solveRoute, routeCost } from './optimizer.js';
-import { FIELDS, parseFile, parseDelimited, detectColumns, buildStops, needsArea } from './importer.js';
-import { geocodeStops, geocodeText, orsMatrix, orsRoadLine, straightMatrix, haversine, testOrsKey } from './services.js';
+import { FIELDS, parseFile, parseDelimited, detectColumns, buildStops, needsArea, cleanAddress } from './importer.js';
+import { geocodeStops, geocodeOne, driveMatrix, roadLine, haversine, testOrsKey } from './services.js';
+import { createMapView } from './mapview.js';
+import { createNavigator } from './nav.js';
 import * as store from './store.js';
 
-const APP_VERSION = '1.0.1';
-const L = window.L;
+const APP_VERSION = '1.1.0';
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -34,6 +35,9 @@ const state = {
   screenClose: null,
   gcAbort: null,
 };
+
+// Older versions stored some addresses with the city and ZIP written twice.
+for (const r of state.routes) for (const s of r.stops || []) if (s.lat == null && s.address) s.address = cleanAddress(s.address);
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -70,21 +74,25 @@ function saveRoute(touch = true) {
 }
 function saveSettings() { store.saveSettings(state.settings); }
 
+function makeStops(stops) {
+  return stops.map((s) => ({
+    notes: '', phone: '', extra: {}, ...s,
+    id: store.uid(),
+    status: 'todo',
+    doneAt: null,
+    leg: null,
+    geo: s.geo ?? (s.lat != null ? 'sheet' : null),
+    precision: s.precision ?? (s.lat != null ? 'exact' : null),
+  }));
+}
+
 function newRoute(name, stops) {
   const r = {
     id: store.uid(),
     name: name || 'New route',
     createdAt: Date.now(),
     updatedAt: Date.now(),
-    stops: stops.map((s) => ({
-      notes: '', phone: '', extra: {}, ...s,
-      id: store.uid(),
-      status: 'todo',
-      doneAt: null,
-      leg: null,
-      geo: s.geo ?? (s.lat != null ? 'sheet' : null),
-      precision: s.precision ?? (s.lat != null ? 'exact' : null),
-    })),
+    stops: makeStops(stops),
     optimizedAt: null,
     metric: null,
     returnLeg: null,
@@ -107,119 +115,86 @@ function openRoute(id) {
 
 /* ---------------------------------------------------------------------- map */
 
-const map = L.map('map', { zoomControl: false, tapHold: true, worldCopyJump: true }).setView(DEFAULT_CENTER, 12);
-map.attributionControl.setPrefix(false);
-
-// Map images. OpenStreetMap's tiles need no key. CARTO's cleaner styles are
-// used only if you add their free key in Settings.
-const OSM_ATTR = '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
-let tileLayer = null, tileKey = '';
 const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+const isDark = () => (state.settings.mapStyle === 'auto' ? darkQuery.matches : state.settings.mapStyle === 'dark');
 
-function tileSource(style) {
-  const key = (state.settings.cartoKey || '').trim();
-  if (key) {
-    const name = style === 'dark' ? 'dark_all' : 'voyager';
-    return {
-      id: `carto-${name}-${key}`,
-      url: `https://{s}.basemaps.cartocdn.com/rastertiles/${name}/{z}/{x}/{y}.png?key=${encodeURIComponent(key)}`,
-      opts: { subdomains: 'abcd', maxZoom: 20, attribution: `${OSM_ATTR} © <a href="https://carto.com/attributions">CARTO</a>` },
-      darkFilter: false,
-    };
-  }
-  return {
-    id: 'osm',
-    url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    opts: { maxZoom: 19, attribution: OSM_ATTR },
-    darkFilter: style === 'dark',
-  };
-}
+const mv = createMapView($('#map'), {
+  center: DEFAULT_CENTER,
+  onPinTap: (id) => {
+    if (state.placing || nav.isActive()) return;
+    state.selectedId = id;
+    renderMarkers();
+    stopActions(id);
+  },
+  onMapTap: (ll) => {
+    if (!state.placing) return;
+    const s = findStop(state.placing);
+    stopPlacing();
+    if (!s) return;
+    Object.assign(s, { lat: ll.lat, lng: ll.lng, geo: 'manual', precision: 'exact' });
+    saveRoute();
+    renderAll();
+    scheduleRoadLine();
+    toast(`Pin placed for ${s.name}.`);
+  },
+  onLongPress: (ll) => addStopAt(ll),
+  onUserMove: () => {
+    state.following = false;
+    $('#btn-locate').classList.remove('is-on');
+    nav.userMovedMap();
+  },
+});
 
-function effectiveStyle() {
-  const s = state.settings.mapStyle;
-  if (s === 'auto') return darkQuery.matches ? 'dark' : 'streets';
-  return s === 'dark' ? 'dark' : 'streets';
-}
 function applyTheme() {
-  const st = effectiveStyle();
-  document.documentElement.dataset.theme = st === 'dark' ? 'dark' : 'light';
-  const src = tileSource(st);
-  if (src.id !== tileKey) {
-    tileLayer?.remove();
-    tileLayer = L.tileLayer(src.url, src.opts).addTo(map);
-    tileKey = src.id;
-  }
-  map.getContainer().classList.toggle('dark-tiles', src.darkFilter);
+  const dark = isDark();
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  mv.setStyle(dark);
 }
 darkQuery.addEventListener?.('change', applyTheme);
 
-const lineLayer = L.layerGroup().addTo(map);
-const markerLayer = L.layerGroup().addTo(map);
-let meMarker = null, meCircle = null;
-
-function pinIcon(s, num, isNext) {
-  const cls = ['pin'];
-  if (isNext) cls.push('is-next');
-  else if (s.status === 'done') cls.push('is-done');
-  else if (s.status === 'skipped') cls.push('is-skipped');
-  else if (s.precision && s.precision !== 'exact') cls.push('is-approx');
-  if (String(num).length >= 3) cls.push('is-long');
-  if (s.id === state.selectedId) cls.push('is-selected');
-  const size = isNext ? 48 : s.status === 'done' ? 26 : 32;
-  return L.divIcon({
-    className: 'pin-wrap',
-    html: `<div class="${cls.join(' ')}"><span>${num}</span></div>`,
-    iconSize: [size, size],
-    iconAnchor: [size / 2, size / 2],
-  });
-}
-
 function renderMarkers() {
-  markerLayer.clearLayers();
   const r = state.route;
-  if (!r) return;
+  if (!r) { mv.setPins([]); return; }
   const next = nextStop(r);
+  const list = [];
   r.stops.forEach((s, i) => {
     if (s.lat == null) return;
     const isNext = s === next;
-    const z = isNext ? 2000 : s.status === 'todo' ? 1000 - i : -1000 - i;
-    L.marker([s.lat, s.lng], { icon: pinIcon(s, i + 1, isNext), zIndexOffset: z, title: `${i + 1}. ${s.name}`, alt: `Stop ${i + 1}, ${s.name}` })
-      .on('click', () => {
-        if (state.placing) return;
-        state.selectedId = s.id;
-        renderMarkers();
-        stopActions(s.id);
-      })
-      .addTo(markerLayer);
+    const cls = ['pin'];
+    if (isNext) cls.push('is-next');
+    else if (s.status === 'done') cls.push('is-done');
+    else if (s.status === 'skipped') cls.push('is-skipped');
+    else if (s.precision && s.precision !== 'exact') cls.push('is-approx');
+    if (String(i + 1).length >= 3) cls.push('is-long');
+    if (s.id === state.selectedId) cls.push('is-selected');
+    list.push({
+      id: s.id, lat: s.lat, lng: s.lng, num: i + 1, cls: cls.join(' '),
+      z: isNext ? 1e6 : s.status === 'todo' ? 1e5 - i : i,
+      label: `Stop ${i + 1}, ${s.name}`,
+    });
   });
+  mv.setPins(list);
 }
 
 function renderLine() {
-  lineLayer.clearLayers();
   const r = state.route;
-  if (!r) return;
+  if (!r || nav.isActive()) { mv.setRouteLine([], 'straight'); return; }
   const todo = todoStops(r);
-  if (!todo.length) return;
-  if (state.roadLine && state.roadSig === routeSig(r)) {
-    L.polyline(state.roadLine, { color: '#ffffff', weight: 8, opacity: 0.9, interactive: false }).addTo(lineLayer);
-    L.polyline(state.roadLine, { color: '#0B6E4F', weight: 5, opacity: 0.95, interactive: false }).addTo(lineLayer);
-    return;
-  }
-  const pts = todo.map((s) => [s.lat, s.lng]);
-  if (state.me) pts.unshift([state.me.lat, state.me.lng]);
-  if (pts.length >= 2) {
-    L.polyline(pts, { color: '#0B6E4F', weight: 5, opacity: 0.9, dashArray: '1 11', lineCap: 'round', interactive: false }).addTo(lineLayer);
-  }
+  if (!todo.length) { mv.setRouteLine([], 'straight'); return; }
+  if (state.roadLine && state.roadSig === routeSig(r)) { mv.setRouteLine(state.roadLine, 'road'); return; }
+  const pts = todo.map((s) => [s.lng, s.lat]);
+  if (state.me) pts.unshift([state.me.lng, state.me.lat]);
+  mv.setRouteLine(pts.length >= 2 ? pts : [], 'straight');
 }
 
 let roadAbort = null, roadTimer = null;
 function scheduleRoadLine() {
   clearTimeout(roadTimer);
-  roadTimer = setTimeout(maybeRoadLine, 900);
+  roadTimer = setTimeout(maybeRoadLine, 1200);
 }
 async function maybeRoadLine() {
-  const r = state.route, key = state.settings.orsKey;
-  if (!r || !key || !state.settings.roadLines) return;
+  const r = state.route;
+  if (!r || !state.settings.roadLines) return;
   const sig = routeSig(r);
   if (state.roadLine && state.roadSig === sig) return;
   const pts = todoStops(r).map((s) => ({ lat: s.lat, lng: s.lng }));
@@ -228,7 +203,7 @@ async function maybeRoadLine() {
   roadAbort?.abort();
   roadAbort = new AbortController();
   try {
-    const line = await orsRoadLine(key, pts, roadAbort.signal);
+    const line = await roadLine(pts, { orsKey: state.settings.orsKey, signal: roadAbort.signal });
     if (line.length && state.route === r && routeSig(r) === sig) {
       state.roadLine = line;
       state.roadSig = sig;
@@ -239,63 +214,47 @@ async function maybeRoadLine() {
   }
 }
 
-function drawMe() {
-  if (!state.me) return;
-  const ll = [state.me.lat, state.me.lng];
-  if (!meMarker) {
-    meMarker = L.marker(ll, { icon: L.divIcon({ className: 'pin-wrap', html: '<div class="me-dot"></div>', iconSize: [24, 24], iconAnchor: [12, 12] }), zIndexOffset: 3000, interactive: false, keyboard: false }).addTo(map);
-    meCircle = L.circle(ll, { radius: state.me.acc || 30, color: '#2F80ED', weight: 1, fillOpacity: 0.12, interactive: false }).addTo(map);
-  } else {
-    meMarker.setLatLng(ll);
-    meCircle.setLatLng(ll).setRadius(Math.min(state.me.acc || 30, 500));
-  }
-}
-
 function topInset() {
-  return $('.topbar').getBoundingClientRect().bottom + 10;
+  return $('.topbar').getBoundingClientRect().bottom + 12;
 }
-function visibleSheet() {
-  const opts = snapOffsets();
-  const o = opts.find((x) => x.name === state.snap) || opts[0];
-  return Math.max(0, sheet.offsetHeight - o.y);
+function mapPadding() {
+  return { top: topInset(), bottom: Math.min(visibleSheet(), window.innerHeight * 0.65) + 20, left: 36, right: 36 };
 }
 
 function fitAll() {
   const r = state.route;
-  let pts = r ? r.stops.filter((s) => s.lat != null && s.status !== 'done').map((s) => [s.lat, s.lng]) : [];
-  if (r && !pts.length) pts = r.stops.filter((s) => s.lat != null).map((s) => [s.lat, s.lng]);
-  if (state.me) pts.push([state.me.lat, state.me.lng]);
-  if (!pts.length) return;
-  const bottom = Math.min(visibleSheet(), window.innerHeight * 0.65) + 16;
-  if (pts.length === 1) return focusOn(L.latLng(pts[0]), 15);
-  map.fitBounds(pts, { paddingTopLeft: [28, topInset()], paddingBottomRight: [28, bottom], maxZoom: 16, animate: true });
+  let pts = r ? r.stops.filter((s) => s.lat != null && s.status !== 'done') : [];
+  if (r && !pts.length) pts = r.stops.filter((s) => s.lat != null);
+  pts = pts.map((s) => ({ lat: s.lat, lng: s.lng }));
+  if (state.me) pts.push(state.me);
+  if (pts.length) mv.fit(pts, mapPadding());
 }
 
-// Center a point in the part of the map the sheet isn't covering.
-function focusOn(latlng, zoom) {
-  const z = zoom ?? Math.max(map.getZoom(), 14);
-  const shift = (Math.min(visibleSheet(), window.innerHeight * 0.65) - topInset()) / 2;
-  const p = map.project(latlng, z).add([0, shift]);
-  map.setView(map.unproject(p, z), z, { animate: true });
+function focusOn(p, zoom) {
+  mv.focus(p, zoom, mapPadding());
 }
 
 /* ------------------------------------------------------------------ location */
 
 function setMe(p) {
-  const me = { lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy, t: Date.now() };
+  const me = {
+    lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy,
+    speed: p.coords.speed, heading: p.coords.heading, t: Date.now(),
+  };
   const moved = !state.me || haversine(state.me, me) > 25;
   state.me = me;
-  drawMe();
+  if (nav.isActive()) { nav.onFix(me); return; }
+  mv.setMe(me, null);
   if (moved) {
     updateNextDistance();
     renderLine();
   }
-  if (state.following) map.panTo([me.lat, me.lng], { animate: true });
+  if (state.following) mv.focus(me, undefined, mapPadding());
 }
 
 function startWatch() {
   if (state.watchId != null || !navigator.geolocation) return;
-  state.watchId = navigator.geolocation.watchPosition(setMe, () => {}, { enableHighAccuracy: true, maximumAge: 10000 });
+  state.watchId = navigator.geolocation.watchPosition(setMe, () => {}, { enableHighAccuracy: true, maximumAge: 0 });
 }
 
 function getPosition(timeout = 12000) {
@@ -330,6 +289,51 @@ function updateNextDistance() {
   }
 }
 
+/* -------------------------------------------------------------- navigation */
+
+const nav = createNavigator({
+  mapview: mv,
+  getMe: () => state.me,
+  settings: () => state.settings,
+  onChange: () => saveSettings(),
+  fallbackNav: (s) => openExternal(s, 'apple'),
+  onArrive: (s, goNext) => {
+    setStatus(s, 'done', { quiet: true });
+    const n = numOf(s);
+    if (!goNext) { toast(`Stop ${n} done.`); return; }
+    const next = nextStop(state.route);
+    if (next) {
+      toast(`Stop ${n} done. Heading to stop ${numOf(next)}.`);
+      nav.start(next, numOf(next));
+    } else {
+      nav.end(false);
+      toast('Route complete. Nice work.', { duration: 6000 });
+    }
+  },
+  onEnd: () => {
+    document.body.classList.remove('is-nav');
+    renderAll();
+    setSheet('peek');
+    if (state.me) focusOn(state.me, 15);
+  },
+});
+
+async function startNav(s) {
+  if (!s || s.lat == null) { toast("This stop isn't on the map yet."); return; }
+  hideActions();
+  closeScreen();
+  if (!state.me || Date.now() - state.me.t > 60000) {
+    busy('Finding your location');
+    try { await getPosition(); } catch (e) { busy(false); toast(locationErrorText(e), { duration: 7000 }); return; }
+    busy(false);
+  }
+  startWatch();
+  document.body.classList.add('is-nav');
+  state.following = false;
+  renderLine();
+  nav.start(s, numOf(s));
+}
+
 /* --------------------------------------------------------------- the sheet */
 
 const sheet = $('#sheet');
@@ -351,6 +355,12 @@ function snapOffsets() {
   return list;
 }
 
+function visibleSheet() {
+  const opts = snapOffsets();
+  const o = opts.find((x) => x.name === state.snap) || opts[0];
+  return Math.max(0, sheet.offsetHeight - o.y);
+}
+
 function setSheet(name, animate = true) {
   const opts = snapOffsets();
   const target = opts.find((o) => o.name === name) || opts[0];
@@ -359,8 +369,8 @@ function setSheet(name, animate = true) {
   sheet.dataset.snap = target.name;
   sheet.style.transform = `translateY(${target.y}px)`;
   if (target.name !== 'full') $('#sheet-body').scrollTop = 0;
-  const attr = map.attributionControl.getContainer();
-  if (attr) attr.style.marginBottom = `${Math.min(sheet.offsetHeight - target.y, window.innerHeight) + 2}px`;
+  const attr = $('.maplibregl-ctrl-bottom-right');
+  if (attr) attr.style.bottom = `${Math.min(sheet.offsetHeight - target.y, window.innerHeight) + 2}px`;
 }
 
 function cycleSheet() {
@@ -475,7 +485,7 @@ function routeHTML(r) {
         <div class="sign-foot">
           <span class="sign-away" id="next-away">${next.leg ? `${fmtDur(next.leg.sec)} drive` : ''}</span>
           <div class="sign-actions">
-            <button class="btn btn-sign-primary" type="button" data-action="navigate" data-id="${next.id}">${ICON.nav}Navigate</button>
+            <button class="btn btn-sign-primary" type="button" data-action="navigate" data-id="${next.id}">${ICON.nav}Go</button>
             <button class="btn btn-sign" id="next-done" type="button" data-action="done" data-id="${next.id}">Done</button>
           </div>
         </div>
@@ -522,9 +532,9 @@ function routeHTML(r) {
         <button class="btn btn-primary" type="button" data-action="optimize" ${mapped.length < 1 ? 'disabled' : ''}>Optimize</button>
       </div>
     </div>
+    ${warns.join('')}
     <div class="sign-wrap">${sign}</div>
     <div id="peek-end"></div>
-    ${warns.join('')}
     <div class="stats">
       <div class="stat"><b>${todo.length}</b><span>stops left</span></div>
       <div class="stat"><b>${sec != null && !r.legsStale ? `${est ? '~' : ''}${fmtDur(sec)}` : '–'}</b><span>driving${est ? ', estimated' : ''}</span></div>
@@ -641,16 +651,10 @@ function promptSheet(title, value, okLabel, placeholder = '') {
       title,
       items: [
         { html: `<input class="input" id="prompt-input" value="${esc(value)}" placeholder="${esc(placeholder)}" style="margin-bottom:8px" enterkeyhint="done">` },
-        {
-          label: okLabel,
-          custom: () => { const v = $('#prompt-input').value.trim(); hideActions(); resolve(v); },
-        },
+        { label: okLabel, custom: () => { const v = $('#prompt-input').value.trim(); hideActions(); resolve(v); } },
       ],
       onDismiss: () => resolve(null),
     });
-    // html items shift indexes: rebuild data-act for the button
-    const btn = $('#actions .btn:not(.is-cancel)');
-    if (btn) btn.dataset.act = '1';
     $('#prompt-input')?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { const v = e.target.value.trim(); hideActions(); resolve(v); }
     });
@@ -672,19 +676,23 @@ async function shareFile(name, text, type) {
 
 /* ------------------------------------------------------------ stop actions */
 
-function navUrl(s) {
+function externalUrl(s, app) {
   const ll = `${s.lat},${s.lng}`;
-  switch (state.settings.navApp) {
+  switch (app) {
     case 'google': return isIOS ? `comgooglemaps://?daddr=${ll}&directionsmode=driving` : `https://www.google.com/maps/dir/?api=1&destination=${ll}&travelmode=driving`;
     case 'waze': return isIOS ? `waze://?ll=${ll}&navigate=yes` : `https://waze.com/ul?ll=${ll}&navigate=yes`;
     default: return isIOS ? `maps://?daddr=${ll}&dirflg=d` : `https://maps.apple.com/?daddr=${ll}&dirflg=d`;
   }
 }
-function openNav(s) {
-  if (s.lat == null) return toast("This stop isn't on the map yet.");
-  const url = navUrl(s);
+function openExternal(s, app) {
+  const url = externalUrl(s, app);
   if (url.startsWith('http')) window.open(url, '_blank', 'noopener');
   else window.location.href = url;
+}
+function openNav(s) {
+  if (!s || s.lat == null) return toast("This stop isn't on the map yet.");
+  if ((state.settings.navApp || 'builtin') === 'builtin') startNav(s);
+  else openExternal(s, state.settings.navApp);
 }
 
 function setStatus(s, status, { quiet = false } = {}) {
@@ -700,7 +708,7 @@ function setStatus(s, status, { quiet = false } = {}) {
     const next = nextStop(state.route);
     if (next) {
       toast(`Stop ${n} done.`, { action: 'Undo', run: () => setStatus(s, prev, { quiet: true }) });
-      if (state.snap !== 'full') focusOn(L.latLng(next.lat, next.lng), map.getZoom());
+      if (state.snap !== 'full') focusOn(next, mv.getZoom());
     } else if (!state.route.stops.some((x) => x.status === 'todo')) {
       toast('Route complete. Nice work.', { action: 'Undo', run: () => setStatus(s, prev, { quiet: true }) });
     } else {
@@ -767,14 +775,14 @@ function stopActions(id) {
     sub: s.address || (s.lat != null ? 'Dropped pin' : ''),
     onDismiss: () => { state.selectedId = null; renderMarkers(); },
     items: [
-      s.lat != null && { label: 'Navigate', run: () => openNav(s) },
-      s.lat != null && { label: 'Show on map', run: () => { setSheet('peek'); focusOn(L.latLng(s.lat, s.lng), 16); } },
+      s.lat != null && { label: 'Go (turn-by-turn)', run: () => openNav(s) },
+      s.lat != null && { label: 'Show on map', run: () => { setSheet('peek'); focusOn(s, 16); } },
       s.status !== 'done' ? { label: 'Mark done', run: () => setStatus(s, 'done') } : { label: 'Mark not done', run: () => setStatus(s, 'todo') },
       s.status === 'todo' && s !== next && s.lat != null && { label: 'Do this one next', run: () => makeNext(s) },
       s.status === 'skipped' ? { label: 'Put back in the route', run: () => setStatus(s, 'todo') }
         : s.status === 'todo' && { label: 'Skip for now', run: () => setStatus(s, 'skipped') },
       {
-        html: `<div class="inline-move"><input class="input" id="move-to" type="number" inputmode="numeric" min="1" max="${total}" placeholder="Move to stop number (1 to ${total})" aria-label="New stop number"><button type="button" class="btn btn-secondary" data-act="${'move'}" style="width:auto;margin:0">Move</button></div>`,
+        html: `<div class="inline-move"><input class="input" id="move-to" type="number" inputmode="numeric" min="1" max="${total}" placeholder="Move to stop number (1 to ${total})" aria-label="New stop number"><button type="button" class="btn btn-secondary" data-act="move" style="width:auto;margin:0">Move</button></div>`,
       },
       s.phone && { label: `Call ${s.phone}`, run: () => { window.location.href = `tel:${s.phone.replace(/[^\d+]/g, '')}`; } },
       { label: 'Edit stop', run: () => editStopScreen(s) },
@@ -792,6 +800,19 @@ function stopActions(id) {
     hideActions();
     moveStop(s, v);
   });
+}
+
+async function addStopAt(ll) {
+  if (!state.route || state.placing || nav.isActive()) return;
+  const name = await promptSheet('Add a stop here', '', 'Add stop', 'Stop name (optional)');
+  if (name == null) return;
+  const r = state.route;
+  const [s] = makeStops([{ name: name || 'Dropped pin', address: '', lat: ll.lat, lng: ll.lng, geo: 'manual', precision: 'exact' }]);
+  r.stops.push(s);
+  saveRoute();
+  renderAll();
+  scheduleRoadLine();
+  toast(`Added stop ${r.stops.length}. Optimize to fit it into the route.`, { action: 'Optimize', run: optimize, duration: 7000 });
 }
 
 /* --------------------------------------------------------------- optimize */
@@ -812,13 +833,10 @@ async function optimize() {
   }
 
   const pts = start ? [{ lat: start.lat, lng: start.lng }, ...todo] : todo.slice();
-  const key = state.settings.orsKey;
-  let mat = null, roadNote = '';
-  if (key && pts.length > 1) {
-    busy('Getting drive times');
-    try { mat = await orsMatrix(key, pts.map((p) => ({ lat: p.lat, lng: p.lng }))); } catch (e) { roadNote = e.message; }
-  }
-  if (!mat) mat = straightMatrix(pts);
+  busy('Getting drive times');
+  const mat = pts.length > 1
+    ? await driveMatrix(pts.map((p) => ({ lat: p.lat, lng: p.lng })), { orsKey: state.settings.orsKey })
+    : { durations: [[0]], distances: [[0]], road: false };
 
   busy('Optimizing');
   await nextFrame();
@@ -860,8 +878,7 @@ async function optimize() {
   const total = ordered.reduce((a, s) => a + (s.leg?.sec || 0), 0) + (r.returnLeg?.sec || 0);
   let msg = `${ordered.length} stops in the best order: ${mat.road ? 'about' : 'roughly'} ${fmtDur(total)} of driving.`;
   if (before - after > 90) msg += ` That's ${fmtDur(before - after)} less than before.`;
-  if (roadNote) msg += ` Used straight-line distances because: ${roadNote}`;
-  else if (!mat.road) msg += ' Times are estimates. Add a free road-data key in Settings for real drive times.';
+  if (!mat.road) msg += ` Times are estimates because the routing server couldn't be reached${mat.note ? ` (${mat.note})` : ''}.`;
   if (unmapped.length) msg += ` ${unmapped.length} unmapped ${unmapped.length === 1 ? 'stop is' : 'stops are'} at the end.`;
   toast(msg, { duration: 9000 });
 }
@@ -914,6 +931,7 @@ function mappingScreen(parsed, baseName) {
     imp.sheetIdx = i;
     imp.rows = imp.sheets[i].rows;
     Object.assign(imp, layoutFor(imp.rows, guessHeader(imp.rows)));
+    if (imp.sheets.length > 1) imp.name = imp.sheets[i].name.trim();
   };
   setSheetIdx(Math.max(0, imp.sheets.findIndex((s) => s.rows.length > 1)));
 
@@ -922,7 +940,7 @@ function mappingScreen(parsed, baseName) {
   const render = () => {
     const data = imp.hasHeader ? imp.rows.slice(1) : imp.rows;
     const sampleFor = (i) => data.find((r) => r[i])?.[i] || '';
-    const opts = (sel) => [`<option value="-1">Not in sheet</option>`, ...imp.headers.map((h, i) => {
+    const opts = (sel) => ['<option value="-1">Not in sheet</option>', ...imp.headers.map((h, i) => {
       const sample = sampleFor(i);
       const label = imp.hasHeader ? `${h}${sample ? ` (${sample.slice(0, 22)})` : ''}` : `${h}: ${sample.slice(0, 28)}`;
       return `<option value="${i}" ${sel === i ? 'selected' : ''}>${esc(label)}</option>`;
@@ -937,7 +955,7 @@ function mappingScreen(parsed, baseName) {
     openScreen('Match your columns', `
       <div class="section">
         <label class="field"><span>Route name</span><input class="input" id="imp-name" value="${esc(imp.name)}" autocomplete="off"></label>
-        ${imp.sheets.length > 1 ? `<label class="field"><span>Sheet</span><select class="input" id="imp-sheet">${imp.sheets.map((s, i) => `<option value="${i}" ${i === imp.sheetIdx ? 'selected' : ''}>${esc(s.name)} (${s.rows.length} rows)</option>`).join('')}</select></label>` : ''}
+        ${imp.sheets.length > 1 ? `<label class="field"><span>Sheet</span><select class="input" id="imp-sheet">${imp.sheets.map((s, i) => `<option value="${i}" ${i === imp.sheetIdx ? 'selected' : ''}>${esc(s.name)} (${s.rows.length - 1} rows)</option>`).join('')}</select></label>` : ''}
         <label class="check-row"><input type="checkbox" id="imp-header" ${imp.hasHeader ? 'checked' : ''}> First row is column names</label>
       </div>
       <div class="section">
@@ -1000,25 +1018,21 @@ function previewHTML(stops) {
   return rows + (stops.length > 3 ? `<div class="preview-row"><span>And ${stops.length - 3} more</span></div>` : '');
 }
 
-async function geocodeFlow(r, onlyStops = null) {
+async function geocodeFlow(r, onlyStops = null, { before } = {}) {
   const need = (onlyStops || r.stops).filter((s) => s.lat == null && s.address);
-  if (!need.length) { closeScreen(); afterImport(r); return; }
+  if (!need.length) { before?.(); closeScreen(); afterImport(r); return; }
   const key = state.settings.orsKey;
-  const secs = key ? Math.ceil(need.length * 0.4) : Math.ceil(need.length * 1.2);
   const ctrl = new AbortController();
   state.gcAbort = ctrl;
   openScreen('Finding addresses', `
     <p class="big-count" id="gc-count">0 of ${need.length}</p>
     <div class="progress"><i id="gc-bar"></i></div>
     <p class="hint" id="gc-now">Starting</p>
-    <p class="hint" style="margin-top:18px">${key
-      ? `This takes about ${fmtDur(secs)}.`
-      : `The free address lookup handles about one address a second, so this takes about ${fmtDur(secs)}.`} Each address is only looked up once. Saved routes open instantly after this.</p>`, {
+    <p class="hint" style="margin-top:18px">This usually takes under a minute. Each address is only looked up once, and saved routes open instantly after this.</p>`, {
     left: null,
     foot: '<button class="btn btn-secondary btn-block" type="button" data-action="gc-stop">Stop and fix the rest later</button>',
   });
-  let focus = state.me;
-  if (!focus) { const c = map.getCenter(); focus = { lat: c.lat, lng: c.lng }; }
+  const focus = state.me || mv.getCenter();
   const res = await geocodeStops(need, {
     key, focus, signal: ctrl.signal,
     onProgress: (i, n, s) => {
@@ -1028,6 +1042,7 @@ async function geocodeFlow(r, onlyStops = null) {
     },
   });
   state.gcAbort = null;
+  before?.();
   saveRoute();
   closeScreen();
   if (res.keyProblem) toast(`${res.keyProblem} Used the free lookup instead.`, { duration: 7000 });
@@ -1045,8 +1060,21 @@ function afterImport(r) {
   if (missing || approx) {
     reviewScreen();
   } else {
-    toast(`${r.stops.length} stops added and saved. Tap Optimize to get the fastest order from where you are.`, { action: 'Optimize', run: optimize, duration: 9000 });
+    toast(`All ${r.stops.length} stops found and saved. Tap Optimize to get the fastest order from where you are.`, { action: 'Optimize', run: optimize, duration: 9000 });
   }
+}
+
+async function retryLookups() {
+  const r = state.route;
+  if (!r) return;
+  const targets = r.stops.filter((s) => s.status !== 'done' && s.address && (s.lat == null || (s.precision && s.precision !== 'exact')));
+  if (!targets.length) return;
+  const saved = new Map(targets.map((s) => [s.id, { lat: s.lat, lng: s.lng, precision: s.precision, geo: s.geo }]));
+  for (const s of targets) Object.assign(s, { address: cleanAddress(s.address), lat: null, lng: null, precision: null, geo: null });
+  await geocodeFlow(r, targets, {
+    // Keep an old approximate pin if the new lookup didn't do better.
+    before: () => targets.forEach((s) => { if (s.lat == null && saved.get(s.id).lat != null) Object.assign(s, saved.get(s.id)); }),
+  });
 }
 
 function reviewScreen() {
@@ -1061,7 +1089,7 @@ function reviewScreen() {
       <button class="grow" type="button" data-action="edit-stop" data-id="${s.id}">
         <b>${numOf(s)}. ${esc(s.name)}</b>
         <span>${esc(s.address || 'No address')}</span>
-        <span>${s.lat == null ? "Not found. Edit the address or place it on the map." : s.precision === 'street' ? 'Pin is on the right street, maybe not the exact building.' : 'Pin is only in the right area.'}</span>
+        <span>${s.lat == null ? 'Not found. Edit the address or place it on the map.' : s.precision === 'street' ? 'Pin is on the right road, maybe not the exact building.' : 'Pin is only in the right area.'}</span>
       </button>
       <button class="more" type="button" data-action="stop" data-id="${s.id}" aria-label="More for ${esc(s.name)}">${ICON.more}</button>
     </div>`).join('');
@@ -1070,10 +1098,11 @@ function reviewScreen() {
       <p style="font-size:16px;line-height:1.45">${found} of ${r.stops.length} stops are on the map.
       ${missing ? `${missing} couldn't be found.` : ''} ${approx ? `${approx} ${approx === 1 ? 'is' : 'are'} approximate.` : ''}</p>
       <p class="hint">Tap a stop to fix its address, or use the dots to place it on the map yourself.</p>
+      ${bad.some((s) => s.address) ? '<button class="btn btn-secondary btn-block" type="button" data-action="retry-lookups" style="margin-top:12px">Look these up again</button>' : ''}
     </div>
     ${bad.length ? `<div class="list">${items}</div>` : '<p class="hint">Everything looks good.</p>'}`, {
     left: 'Close',
-    foot: `<button class="btn btn-primary btn-block" type="button" data-action="close-screen">Go to the map</button>`,
+    foot: '<button class="btn btn-primary btn-block" type="button" data-action="close-screen">Go to the map</button>',
   });
 }
 
@@ -1118,20 +1147,20 @@ async function lookupStop(s) {
   if (!s.address) return toast('Add an address first.');
   busy('Looking up address');
   let r = null;
-  try { r = await geocodeText(s.address, { key: state.settings.orsKey, focus: state.me }); } catch (e) {
-    try { r = await geocodeText(s.address, { focus: state.me }); } catch { r = null; }
+  try { r = await geocodeOne(s, { key: state.settings.orsKey, focus: state.me || mv.getCenter() }); } catch {
+    try { r = await geocodeOne(s, { focus: state.me || mv.getCenter() }); } catch { r = null; }
   }
   busy(false);
   if (!r) { toast("Couldn't find that address. Check the spelling, or place it on the map."); return false; }
   Object.assign(s, { lat: r.lat, lng: r.lng, precision: r.precision, geo: r.source });
-  if (r.precision !== 'rough') store.geocache_.set(s.address, r);
+  if (r.precision === 'exact') store.geocache_.set(s.address, r);
   toast(r.precision === 'exact' ? 'Found it.' : 'Found an approximate spot. Check the pin.');
   return true;
 }
 
-function addStopScreen(prefill = {}) {
+function addStopScreen() {
   openScreen('Add stop', `
-    <label class="field"><span>Name</span><input class="input" id="add-name" value="${esc(prefill.name || '')}" autocomplete="off"></label>
+    <label class="field"><span>Name</span><input class="input" id="add-name" autocomplete="off"></label>
     <label class="field"><span>Address</span><input class="input" id="add-address" autocomplete="off" placeholder="Street, City, State ZIP"></label>
     <label class="field"><span>Notes</span><input class="input" id="add-notes" autocomplete="off"></label>
     <p class="hint">Tip: you can also press and hold anywhere on the map to drop a stop there.</p>`, {
@@ -1284,9 +1313,10 @@ function settingsScreen() {
   const seg = (name, value, options) => `<div class="segmented" role="radiogroup">${options.map(([v, label]) => `<label><input type="radio" name="${name}" value="${v}" ${value === v ? 'checked' : ''}><span>${esc(label)}</span></label>`).join('')}</div>`;
   openScreen('Settings', `
     <div class="section">
-      <h2>Navigate with</h2>
-      ${seg('navApp', s.navApp, [['apple', 'Apple Maps'], ['google', 'Google Maps'], ['waze', 'Waze']])}
-      <p class="hint">Google Maps and Waze need their apps installed on this phone.</p>
+      <h2>Directions</h2>
+      ${seg('navApp', s.navApp || 'builtin', [['builtin', 'In this app'], ['apple', 'Apple'], ['google', 'Google'], ['waze', 'Waze']])}
+      <p class="hint">"In this app" gives turn-by-turn directions right here. The others hand each stop to that app (Google Maps and Waze need their apps installed).</p>
+      <label class="check-row" style="margin-top:6px"><input type="checkbox" id="set-voice" ${s.voice ? 'checked' : ''}> Spoken directions</label>
     </div>
     <div class="section">
       <h2>Where the route ends</h2>
@@ -1294,25 +1324,22 @@ function settingsScreen() {
     </div>
     <div class="section">
       <h2>Map look</h2>
-      ${seg('mapStyle', s.mapStyle === 'osm' ? 'streets' : s.mapStyle, [['auto', 'Auto'], ['streets', 'Light'], ['dark', 'Dark']])}
+      ${seg('mapStyle', ['auto', 'streets', 'dark'].includes(s.mapStyle) ? s.mapStyle : 'auto', [['auto', 'Auto'], ['streets', 'Light'], ['dark', 'Dark']])}
       <p class="hint">Auto switches to dark when your phone is in dark mode.</p>
-      <label class="field" style="margin-top:14px"><span>CARTO map key (optional)</span><input class="input" id="set-carto" value="${esc(s.cartoKey || '')}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Leave empty to use OpenStreetMap"></label>
-      <p class="hint" style="margin-top:-6px">The map works without this. A free key from <a href="https://carto.com/basemaps/apikey" target="_blank" rel="noopener">carto.com/basemaps/apikey</a> (no account needed) switches to a cleaner, more muted map style.</p>
-    </div>
-    <div class="section">
-      <h2>Real drive times (optional, free)</h2>
-      <p class="hint" style="margin:0 0 10px">Without this, the app plans with straight-line distances, which works well in most towns. With a free OpenRouteService key, it uses real driving times, finds addresses faster, and draws the route along the roads.</p>
-      <p class="hint" style="margin:0 0 12px">1. Make a free account at <a href="https://openrouteservice.org/plans/" target="_blank" rel="noopener">openrouteservice.org</a>. 2. Copy your API key from the dashboard. 3. Paste it here.</p>
-      <label class="field"><span>OpenRouteService key</span><input class="input" id="set-key" value="${esc(s.orsKey)}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your key"></label>
-      <div class="two">
-        <button class="btn btn-secondary" type="button" data-action="test-key">Test key</button>
-        <button class="btn btn-secondary" type="button" data-action="clear-key" ${s.orsKey ? '' : 'disabled'}>Remove key</button>
-      </div>
-      <label class="check-row" style="margin-top:8px"><input type="checkbox" id="set-roadlines" ${s.roadLines ? 'checked' : ''}> Draw the route along roads</label>
+      <label class="check-row" style="margin-top:6px"><input type="checkbox" id="set-roadlines" ${s.roadLines ? 'checked' : ''}> Draw the route along roads</label>
     </div>
     <div class="section">
       <h2>Your area</h2>
       <label class="field"><span>Added to addresses with no city</span><input class="input" id="set-area" value="${esc(s.areaHint)}" placeholder="City, State" autocomplete="off"></label>
+    </div>
+    <div class="section">
+      <h2>Backup routing (optional)</h2>
+      <p class="hint" style="margin:0 0 10px">Drive times and directions come from a free OpenStreetMap routing server, no key needed. If that server is ever down, a free OpenRouteService key is used instead. Make one at <a href="https://openrouteservice.org/plans/" target="_blank" rel="noopener">openrouteservice.org</a> and paste it here.</p>
+      <label class="field"><span>OpenRouteService key</span><input class="input" id="set-key" value="${esc(s.orsKey)}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Optional"></label>
+      <div class="two">
+        <button class="btn btn-secondary" type="button" data-action="test-key">Test key</button>
+        <button class="btn btn-secondary" type="button" data-action="clear-key" ${s.orsKey ? '' : 'disabled'}>Remove key</button>
+      </div>
     </div>
     <div class="section">
       <h2>Storage</h2>
@@ -1321,7 +1348,7 @@ function settingsScreen() {
     </div>
     <div class="section">
       <h2>About</h2>
-      <p class="hint">Route Runner ${APP_VERSION}. Map data and tiles © OpenStreetMap contributors (CARTO tiles when a CARTO key is added). Address lookup by Nominatim and OpenRouteService. Maps drawn with Leaflet. Excel files read with SheetJS.</p>
+      <p class="hint">Route Runner ${APP_VERSION}. Map by OpenFreeMap and OpenMapTiles, map data © OpenStreetMap contributors. Directions by OSRM on the FOSSGIS routing server. Address lookup by the U.S. Census Bureau and Nominatim. Excel files read with SheetJS.</p>
     </div>`, { left: 'Done' });
 
   document.querySelectorAll('#screen input[type=radio]').forEach((el) => el.addEventListener('change', (e) => {
@@ -1329,18 +1356,8 @@ function settingsScreen() {
     saveSettings();
     if (e.target.name === 'mapStyle') applyTheme();
   }));
-  $('#set-carto').addEventListener('change', (e) => {
-    state.settings.cartoKey = e.target.value.trim();
-    saveSettings();
-    applyTheme();
-  });
-  $('#set-key').addEventListener('change', (e) => {
-    state.settings.orsKey = e.target.value.trim();
-    saveSettings();
-    state.roadLine = null;
-    state.roadSig = '';
-    maybeRoadLine();
-  });
+  $('#set-voice').addEventListener('change', (e) => { state.settings.voice = e.target.checked; saveSettings(); });
+  $('#set-key').addEventListener('change', (e) => { state.settings.orsKey = e.target.value.trim(); saveSettings(); });
   $('#set-roadlines').addEventListener('change', (e) => {
     state.settings.roadLines = e.target.checked;
     saveSettings();
@@ -1354,7 +1371,7 @@ function settingsScreen() {
 async function demoRoute() {
   busy('Finding your location');
   let c;
-  try { c = await getPosition(); } catch { const m = map.getCenter(); c = { lat: m.lat, lng: m.lng }; }
+  try { c = await getPosition(); } catch { c = mv.getCenter(); }
   busy(false);
   const stops = [];
   for (let i = 0; i < 15; i++) {
@@ -1392,8 +1409,10 @@ const ACTIONS = {
   'toggle-done': (id) => { const s = findStop(id); setStatus(s, s.status === 'todo' ? 'done' : 'todo'); },
   stop: (id) => { state.selectedId = id; renderMarkers(); stopActions(id); },
   review: () => reviewScreen(),
+  'retry-lookups': () => retryLookups(),
   'close-screen': () => closeScreen(),
   'add-stop': () => addStopScreen(),
+  'edit-stop': (id) => editStopScreen(findStop(id)),
   reset: async () => {
     if (await confirmSheet('Reset progress?', 'Every stop goes back to not done. The order stays the same.', 'Reset progress')) resetRoute(state.route);
   },
@@ -1452,8 +1471,7 @@ const ACTIONS = {
     const notes = $('#add-notes').value.trim();
     if (!address) return toast('Add an address, or press and hold on the map to drop a pin.');
     const r = state.route;
-    const [s] = newRoute('tmp', [{ name: name || address.split(',')[0], address, notes }]).stops;
-    state.routes.shift();
+    const [s] = makeStops([{ name: name || address.split(',')[0], address, notes }]);
     r.stops.push(s);
     const found = await lookupStop(s);
     if (!found) s.geo = 'failed';
@@ -1469,9 +1487,9 @@ const ACTIONS = {
     state.settings.orsKey = key;
     saveSettings();
     busy('Testing key');
-    try { await testOrsKey(key); busy(false); toast('Key works. Optimize will now use real drive times.'); maybeRoadLine(); } catch (e) { busy(false); toast(e.message || "That key didn't work."); }
+    try { await testOrsKey(key); busy(false); toast('Key works. It will be used if the free routing server is down.'); } catch (e) { busy(false); toast(e.message || "That key didn't work."); }
   },
-  'clear-key': () => { state.settings.orsKey = ''; saveSettings(); state.roadLine = null; renderLine(); settingsScreen(); toast('Key removed.'); },
+  'clear-key': () => { state.settings.orsKey = ''; saveSettings(); settingsScreen(); toast('Key removed.'); },
   'clear-cache': () => { store.geocache_.clear(); settingsScreen(); toast('Forgot all looked-up addresses.'); },
 };
 
@@ -1490,40 +1508,13 @@ $('#btn-locate').addEventListener('click', async () => {
     const me = await getPosition();
     state.following = true;
     $('#btn-locate').classList.add('is-on');
-    focusOn(L.latLng(me.lat, me.lng), Math.max(map.getZoom(), 15));
+    focusOn(me, Math.max(mv.getZoom(), 15));
   } catch (e) {
     toast(locationErrorText(e), { duration: 7000 });
   }
 });
-map.on('dragstart', () => { state.following = false; $('#btn-locate').classList.remove('is-on'); });
 
-map.on('click', (e) => {
-  if (!state.placing) return;
-  const s = findStop(state.placing);
-  stopPlacing();
-  if (!s) return;
-  Object.assign(s, { lat: e.latlng.lat, lng: e.latlng.lng, geo: 'manual', precision: 'exact' });
-  saveRoute();
-  renderAll();
-  scheduleRoadLine();
-  toast(`Pin placed for ${s.name}.`);
-});
-
-map.on('contextmenu', async (e) => {
-  if (!state.route || state.placing) return;
-  const name = await promptSheet('Add a stop here', '', 'Add stop', 'Stop name (optional)');
-  if (name == null) return;
-  const r = state.route;
-  const [s] = newRoute('tmp', [{ name: name || 'Dropped pin', address: '', lat: e.latlng.lat, lng: e.latlng.lng, geo: 'manual', precision: 'exact' }]).stops;
-  state.routes.shift();
-  r.stops.push(s);
-  saveRoute();
-  renderAll();
-  scheduleRoadLine();
-  toast(`Added stop ${r.stops.length}. Optimize to fit it into the route.`, { action: 'Optimize', run: optimize, duration: 7000 });
-});
-
-window.addEventListener('resize', () => setSheet(state.snap, false));
+window.addEventListener('resize', () => { setSheet(state.snap, false); mv.resize(); });
 // The page itself must never scroll; only the panels inside it do.
 for (const el of [document.documentElement, document.body]) {
   el.addEventListener('scroll', () => { if (el.scrollTop || el.scrollLeft) { el.scrollTop = 0; el.scrollLeft = 0; } });
@@ -1547,4 +1538,4 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 }
 
 // Exposed for automated tests only.
-window.__rr = { state, optimize, openRoute };
+window.__rr = { state, optimize, openRoute, nav, mv, startNav };

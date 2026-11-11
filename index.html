@@ -14,7 +14,7 @@
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/png" href="icons/icon-192.png">
   <link rel="preload" href="fonts/overpass-800.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="lib/leaflet/leaflet.css">
+  <link rel="stylesheet" href="lib/maplibre/maplibre-gl.css">
   <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
@@ -45,6 +45,7 @@
     <div class="sheet-body" id="sheet-body"></div>
   </section>
 
+  <div class="nav" id="nav" hidden></div>
   <div class="screen" id="screen" role="dialog" aria-modal="true" hidden></div>
   <div class="actions-backdrop" id="actions" hidden></div>
   <div class="busy" id="busy" role="status" hidden></div>
@@ -53,7 +54,7 @@
   <input type="file" id="file-input" accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsm,.ods,.numbers,text/csv" hidden>
   <input type="file" id="backup-input" accept=".json,application/json" hidden>
 
-  <script src="lib/leaflet/leaflet.js"></script>
+  <script src="lib/maplibre/maplibre-gl.js"></script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

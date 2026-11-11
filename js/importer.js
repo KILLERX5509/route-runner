@@ -205,10 +205,8 @@ export function buildStops(rows, mapping, { hasHeader, headers, areaHint }) {
     const pair = street.match(/^\s*(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*$/);
     if (pair && !validLatLng(lat, lng)) { lat = +pair[1]; lng = +pair[2]; }
 
-    const stateZip = [get('state'), get('zip')].filter(Boolean).join(' ');
-    const cityLine = [get('city'), stateZip].filter(Boolean).join(', ');
     const streetLine = pair ? '' : [street, get('address2')].filter(Boolean).join(' ');
-    let address = [streetLine, cityLine].filter(Boolean).join(', ');
+    let address = composeAddress(streetLine, get('city'), get('state'), get('zip'));
     if (areaHint && address && needsArea(address)) address += `, ${areaHint.trim()}`;
 
     const hasLL = validLatLng(lat, lng);
@@ -232,5 +230,50 @@ export function buildStops(rows, mapping, { hasHeader, headers, areaHint }) {
 
 // True if an address has no city/state/ZIP part.
 export function needsArea(address) {
-  return !address.includes(',') && !/\b\d{5}\b/.test(address);
+  return !address.includes(',') && !hasZipAtEnd(address);
+}
+
+// A ZIP at the end, after a comma or a state code ("..., MS 39701").
+const hasZipAtEnd = (s) => /(?:,|\b[A-Za-z]{2})\s*\d{5}(?:-\d{4})?\s*$/.test(s);
+
+const wordIn = (text, part) => {
+  if (!part) return false;
+  const re = new RegExp(`(^|[^a-z0-9])${part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i');
+  return re.test(text);
+};
+
+// Street + city/state/ZIP columns -> one address, without repeating parts the
+// street cell already has ("221 5th St S, Columbus, MS 39701" stays as is).
+export function composeAddress(street, city, state, zip) {
+  street = (street || '').trim();
+  city = (city || '').trim();
+  state = (state || '').trim();
+  zip = (zip || '').trim();
+  // Only the part after the first comma counts as "already has city/state/ZIP",
+  // so "11449 MS-12 W" (5-digit house number, MS in the road name) isn't fooled.
+  const tail = street.split(',').slice(1).join(',');
+  const complete = hasZipAtEnd(street) || /,\s*[^,]+,\s*[A-Za-z]{2}\b/.test(street);
+  const parts = [street];
+  if (!complete) {
+    // A "city" cell that starts with a number is a data-entry slip, not a city.
+    if (city && !/^\d/.test(city) && !wordIn(tail, city)) parts.push(city);
+    const sz = [wordIn(tail, state) ? '' : state, wordIn(tail, zip) ? '' : zip].filter(Boolean).join(' ');
+    if (sz) parts.push(sz);
+  }
+  return cleanAddress(parts.filter(Boolean).join(', '));
+}
+
+// Remove repeated pieces: "221 5th St S, Columbus, MS 39701, Columbus, MS 39701"
+// -> "221 5th St S, Columbus, MS 39701".
+export function cleanAddress(address) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of String(address || '').split(',')) {
+    const p = raw.replace(/\s+/g, ' ').trim();
+    const key = p.toLowerCase();
+    if (!p || seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out.join(', ');
 }

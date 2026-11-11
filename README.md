@@ -1,71 +1,70 @@
 # Route Runner
 
 A free iPhone web app for driving a long list of stops. Import a spreadsheet,
-every stop gets a numbered pin, and Optimize puts them in the fastest order
-from where you are. Routes are saved on the phone so you only import once.
+every stop gets a numbered pin, Optimize puts them in the fastest order from
+where you are, and Go gives turn-by-turn directions right inside the app.
+Routes are saved on the phone so you only import once.
 
-## Put it online (free, about 5 minutes, done once)
+## Put it online (free, done once)
 
-Use a computer with Chrome or Edge.
+1. Create a public GitHub repository named `route-runner`.
+2. Upload everything inside this folder (index.html, css, js, lib, fonts, icons,
+   and the rest). Drag the contents, not the folder itself.
+3. Settings > Pages > Deploy from a branch > main, / (root) > Save.
+4. Your link: `https://YOUR-USERNAME.github.io/route-runner/`
 
-1. Go to github.com and sign in. Click **New** (new repository).
-2. Name it `route-runner`, choose **Public**, and click **Create repository**.
-3. On the empty repo page, click **uploading an existing file**.
-4. Unzip `route-runner.zip`. Open the folder, select **everything inside it**
-   (index.html, css, js, lib, fonts, icons, and the rest) and drag it onto the page.
-   Click **Commit changes**.
-5. Go to **Settings > Pages**. Under "Build and deployment", set Source to
-   **Deploy from a branch**, Branch to **main** and **/ (root)**, then **Save**.
-6. Wait a minute or two, then refresh that page. It shows your link, which looks
-   like `https://YOUR-USERNAME.github.io/route-runner/`.
+To update later, upload the new files the same way. They replace the old ones.
 
 ## Put it on your iPhone
 
-1. Open your link in **Safari** (it has to be Safari).
-2. Tap the Share button, then **Add to Home Screen**, then **Add**.
-3. Open Route Runner from the home screen icon and allow location when asked.
-4. Do your imports **inside the home screen app**. It keeps its own storage,
-   separate from Safari.
+1. Open your link in Safari, tap Share, then Add to Home Screen.
+2. Open Route Runner from the home screen and allow location.
+3. Import inside the home screen app. It keeps its own storage, separate from Safari.
 
 ## Using it
 
-- **Import spreadsheet**: pick an .xlsx or .csv file from Files or iCloud Drive.
-  Columns are matched automatically (name, address, city, state, ZIP, notes,
-  phone, or latitude/longitude). Any layout works; you can fix the matching.
-- Addresses are looked up once, then saved with the route.
-- **Optimize** puts the remaining stops in the fastest order from your location.
-  Under Settings you can choose to end at the last stop or come back to the start.
-- **Navigate** hands the next stop to Apple Maps, Google Maps, or Waze (Settings).
-  **Done** checks it off and moves to the next one.
-- Tap any stop for more: skip it, do it next, move it to a number, edit it,
-  place its pin by hand, or call its phone number.
-- Press and hold the map to drop a new stop.
-- **Saved routes** holds every route with its order and progress. Use
+- **Import spreadsheet**: .xlsx or .csv from Files or iCloud Drive. Columns are
+  matched automatically. If a file has several sheets, pick one.
+- **Optimize**: puts the remaining stops in the fastest order from your location,
+  using real drive times.
+- **Go**: turn-by-turn directions in the app, with spoken directions, rerouting if
+  you miss a turn, and an arrival card. "Done, go to next stop" checks off the stop
+  and starts directions to the next one.
+- Tap any stop to skip it, do it next, move it to a number, edit it, place its
+  pin by hand, or call it. Press and hold the map to drop a new stop.
+- **Saved routes** keeps every route with its order and progress. Use
   **Save backup** now and then to keep a copy in iCloud Drive.
 
-## Optional: real drive times
+## Good to know
 
-Without a key, Optimize uses straight-line distances (works well in most towns)
-and address lookup runs about one per second. For real driving times, faster
-lookup, and route lines that follow the roads, make a free account at
-openrouteservice.org, copy your API key, and paste it under Settings.
-The key is stored only on your phone.
+- Keep Route Runner open on screen while driving. iPhone web apps can't track
+  location in the background; the app keeps the screen awake for you
+  (iOS 18.4 or later). If you switch apps, directions pick up when you come back.
+- Drive times come from free OpenStreetMap routing and don't include live traffic.
+- If directions don't speak, check the volume. Spoken directions can be turned
+  off in Settings or from the Voice button while driving.
+- Settings > Directions can hand stops to Apple Maps, Google Maps, or Waze instead.
 
-## Updating
+## Free services used (no keys needed)
 
-Upload changed files to the same GitHub repo. The app picks up the new version
-the next time it opens with a signal. Your routes on the phone aren't affected.
+- Map: MapLibre GL with OpenFreeMap tiles. Map data © OpenStreetMap contributors.
+- Directions and drive times: OSRM on the FOSSGIS routing server.
+- Address lookup: U.S. Census Bureau geocoder, then OpenStreetMap Nominatim.
+- Optional backup: a free OpenRouteService key (Settings) is used if the routing
+  server is down.
 
 ## What's inside
 
 - `index.html`, `css/app.css`: layout and design
-- `js/app.js`: map, panels, import flow, saved routes, settings
+- `js/app.js`: panels, import flow, saved routes, settings
+- `js/mapview.js`: the map
+- `js/nav.js`, `js/router.js`: turn-by-turn navigation
 - `js/optimizer.js`: route ordering (exact up to 13 stops; fast local search above)
-- `js/importer.js`: CSV/Excel reading and column matching
+- `js/importer.js`: CSV/Excel reading, column matching, address cleanup
 - `js/services.js`: address lookup and drive times
 - `js/store.js`: on-phone storage
 - `sw.js`, `manifest.webmanifest`, `icons/`: home screen app and offline support
-- `lib/leaflet` (map library, BSD-2), `fonts/` (Overpass, SIL Open Font License)
+- `lib/maplibre` (BSD-3), `fonts/` (Overpass, SIL Open Font License)
 
-Map data and tiles © OpenStreetMap contributors. If you add a free CARTO key
-in Settings, the map uses CARTO's tiles instead.
+If your repo still has an old `lib/leaflet` folder from version 1.0, you can
+delete it; nothing uses it anymore.
