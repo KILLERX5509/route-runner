@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0B6E4F">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Route Runner">
+  <meta name="format-detection" content="telephone=no">
+  <title>Route Runner</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="preload" href="fonts/overpass-800.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="lib/leaflet/leaflet.css">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div id="map" aria-label="Map"></div>
+
+  <header class="topbar">
+    <button class="pill" id="btn-routes" type="button">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h6l2 2h10v10.5H3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+      <span>Saved routes</span>
+    </button>
+    <button class="round" id="btn-settings" type="button" aria-label="Settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+    </button>
+  </header>
+
+  <div class="maptools" id="maptools">
+    <button class="round" id="btn-locate" type="button" aria-label="Show my location">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 20 21l-8-4.2L4 21z" fill="currentColor" transform="rotate(45 12 12)"/></svg>
+    </button>
+    <button class="round" id="btn-fit" type="button" aria-label="Show every stop">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="sheet" id="sheet" aria-label="Route">
+    <div class="sheet-body" id="sheet-body"></div>
+  </section>
+
+  <div class="screen" id="screen" role="dialog" aria-modal="true" hidden></div>
+  <div class="actions-backdrop" id="actions" hidden></div>
+  <div class="busy" id="busy" role="status" hidden></div>
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <input type="file" id="file-input" accept=".csv,.tsv,.txt,.xlsx,.xls,.xlsm,.ods,.numbers,text/csv" hidden>
+  <input type="file" id="backup-input" accept=".json,application/json" hidden>
+
+  <script src="lib/leaflet/leaflet.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

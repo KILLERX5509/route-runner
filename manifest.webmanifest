@@ -1,0 +1,16 @@
+{
+  "name": "Route Runner",
+  "short_name": "Route Runner",
+  "description": "Map a spreadsheet of stops, number them, and drive them in the fastest order.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F4F6F5",
+  "theme_color": "#0B6E4F",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
